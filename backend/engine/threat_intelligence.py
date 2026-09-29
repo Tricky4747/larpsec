@@ -60,14 +60,20 @@ class ThreatIntelligencePredictor:
 
         print(f"Supplychainer V3 Brain Loaded: Production-Ready.")
 
-    def _encode_feature(self, value: str, key: str) -> int:
+    def _encode_feature(self, value: str, key: str):
+        """Case-insensitive lookup. Returns None if the value is not in the
+        training vocabulary (the old code silently used classes[0], so the model
+        predicted for a random lane)."""
         encoder = self.encoders[key]
-        classes = list(encoder.classes_)
-        if key in ["Origin_Node", "Destination_Node"]:
-            resolved = self.hub_map.get(value, value)
-            if resolved in classes: return encoder.transform([resolved])[0]
-        if value in classes: return encoder.transform([value])[0]
-        return encoder.transform([classes[0]])[0]
+        lookup = {str(c).strip().lower(): c for c in encoder.classes_}
+        candidates = [value]
+        if key in ("Origin_Node", "Destination_Node"):
+            candidates.insert(0, self.hub_map.get(value, value))
+        for cand in candidates:
+            hit = lookup.get(str(cand).strip().lower())
+            if hit is not None:
+                return int(encoder.transform([hit])[0])
+        return None
 
     def predict_worst_case_delay(self, origin: str, destination: str, transport_mode: str, 
                                  leg_type: str = "Global_Freight", condition_flag: str = "Clear", 
@@ -96,6 +102,9 @@ class ThreatIntelligencePredictor:
             feat_mode = self._encode_feature(transport_mode, 'Transport_Mode')
             feat_leg = self._encode_feature(leg_type, 'Leg_Type')
             feat_cond = self._encode_feature(condition_flag, 'Condition_Flag')
+            if None in (feat_origin, feat_dest, feat_mode, feat_leg, feat_cond):
+                return {"final_delay_presented": 0.0, "covered": False,
+                        "calibration_reason": "Lane not in model training vocabulary"}
             
             X_input = pd.DataFrame([{'Leg_Type': feat_leg, 'Origin_Node': feat_origin, 'Destination_Node': feat_dest,
                                      'Transport_Mode': feat_mode, 'Condition_Flag': feat_cond, 'NLP_Severity_Score': nlp_score}])
@@ -136,7 +145,7 @@ class ThreatIntelligencePredictor:
             
         except Exception as e:
             print(f"Calibration Inference Error: {e}")
-            return {"final_delay_presented": 0.0, "calibration_reason": "Inference Error"}
+            return {"final_delay_presented": 0.0, "covered": False, "calibration_reason": "Inference Error"}
 
 class ContrastiveNLPEngine:
     """Stage 2: PRODUCTION Contrastive NLP Brain."""
