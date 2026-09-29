@@ -25,12 +25,20 @@ class ThreatIntelligencePredictor:
         self.profiles = {}
         
         self.hub_map = {
-            "Seattle": "Seattle Port", "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
+            "Seattle": "Seattle Port", "Seattle-Tacoma": "Seattle Port", "Seattle BNSF Terminal": "Seattle Port",
+            "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
             "Los Angeles": "Los Angeles Port", "Salt Lake City": "Salt Lake City Hub", "Denver": "Denver Terminal",
-            "Phoenix": "Phoenix Logistics", "Dallas": "Dallas Corridor", "Houston": "Houston Port",
-            "Chicago": "Chicago Rail Hub", "St. Louis": "St. Louis Hub", "Atlanta": "Atlanta Air Hub",
+            "Phoenix": "Phoenix Logistics", "Dallas": "Dallas Corridor", "Alliance Texas Logistics Hub": "Dallas Corridor",
+            "Houston": "Houston Port",
+            "Chicago": "Chicago Rail Hub", "Chicago Intermodal Complex": "Chicago Rail Hub", "Chicago O'Hare International": "Chicago Rail Hub",
+            "St. Louis": "St. Louis Hub",
+            "Atlanta": "Atlanta Air Hub", "Hartsfield-Jackson Atlanta": "Atlanta Air Hub",
             "Miami": "Miami Port", "New York": "New York Port", "Boston": "Boston Terminal",
-            "Mumbai": "Mumbai Port", "Kochi": "Kochi Port", "Delhi": "Delhi Air Cargo", "Chennai": "Chennai Port"
+            "Mumbai": "Mumbai Port", "Kochi": "Kochi Port", "Delhi": "Delhi Air Cargo", "Chennai": "Chennai Port",
+            "Shanghai": "Shanghai Port", "Singapore": "Singapore Port",
+            "Rotterdam": "Rotterdam Port",
+            "Dubai": "Dubai Logistics Hub", "Al Maktoum International": "Dubai Logistics Hub",
+            "Suez Canal": "Suez Canal",
         }
         
         if not lazy_load:

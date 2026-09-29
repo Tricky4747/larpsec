@@ -6,6 +6,7 @@ from .multimodal_network import MODE_PROFILES, create_multimodal_network
 from .threat_intelligence import ThreatIntelligencePredictor, ContrastiveNLPEngine, CARFFilter
 from .news_ingestion import DynamicNewsIngestor
 from .node_resolver import NodeResolver
+from backend.engine.threat_intelligence import ThreatIntelligencePredictor
 
 class RouteRecommender:
     """
@@ -103,6 +104,43 @@ class RouteRecommender:
                             edges_to_remove.append((u, v))
                     G_p.remove_edges_from(edges_to_remove)
 
+                def get_ml_delay(u, v, d, threat_score=0.0):
+                    if d.get("type") != "transit":
+                        return 0.0, None, "not_transit"
+
+                    u_data = G_p.nodes[u]
+                    v_data = G_p.nodes[v]
+
+                    u_parent = u_data.get("parent_city")
+                    v_parent = v_data.get("parent_city")
+
+                    if not u_parent or not v_parent:
+                        return 0.0, None, "missing_parent_city"
+
+                    u_ml = self.predictor.hub_map.get(u_parent, u_parent)
+                    v_ml = self.predictor.hub_map.get(v_parent, v_parent)
+
+                    if u_ml == v_ml:
+                        return 0.0, None, "intra_region"
+
+                    if not self.predictor.is_trained or not self.predictor.encoders:
+                        return 0.0, None, "predictor_not_ready"
+
+                    origin_classes = self.predictor.encoders["Origin_Node"].classes_
+                    destination_classes = self.predictor.encoders["Destination_Node"].classes_
+
+                    if u_ml not in origin_classes or v_ml not in destination_classes:
+                        return 0.0, None, "unsupported_nodes"
+
+                    result = self.predictor.predict_worst_case_delay(
+                        origin=u_parent,
+                        destination=v_parent,
+                        transport_mode=d["transport_mode"],
+                        nlp_score=threat_score
+                    )
+
+                    return result.get("final_delay_presented", 0.0), result, "applied"
+
                 def weight_func(u, v, d):
                     mode = d["transport_mode"]
                     base_t = d["baseline_time"]
@@ -118,6 +156,10 @@ class RouteRecommender:
                     if p_id in disruptions:
                         threat = max(threat, disruptions[p_id]["threat"])
                         delay += disruptions[p_id]["delay"]
+
+                    # ML p85 delay (threat computed above, including any active disruption)
+                    ml_delay, _, _ = get_ml_delay(u, v, d, threat)
+                    delay += ml_delay
                     
                     if persona == "FASTEST":
                         return base_t + delay
@@ -137,11 +179,17 @@ class RouteRecommender:
                 legs = []
                 total_time, total_cost, max_threat = 0, 0, 0
                 trace = {
-                    "eta": {"transit": 0, "transfer": 0, "scenario": 0},
+                    "eta": {
+                        "transit": 0,
+                        "transfer": 0,
+                        "scenario": 0,
+                        "ml_p85": 0
+                    },
                     "cost": {"transit": 0, "transfer": 0, "scenario": 0},
                     "risk": {"baseline": 0, "scenario": 0}
                 }
 
+                seen_ml_pairs = set()
                 for i in range(len(path)-1):
                     u, v = path[i], path[i+1]
                     d = G_p[u][v]
@@ -154,15 +202,71 @@ class RouteRecommender:
                     l_threat = d.get("base_threat", 0.05)
                     l_news = d.get("base_news", "Standard conditions")
                     l_source = "FALLBACK"
+
+                    # Resolve disruption-adjusted threat BEFORE the ML call, so an active
+                    # scenario's threat actually reaches predict_worst_case_delay().
+                    if p_id in disruptions:
+                        l_threat = max(l_threat, disruptions[p_id]["threat"])
+
+                    ml_delay, ml_result, status_reason = get_ml_delay(u, v, d, l_threat)
+
+                    print(
+                        f"[ML EDGE] "
+                        f"{G_p.nodes[u].get('physical_id', u)} -> "
+                        f"{G_p.nodes[v].get('physical_id', v)} | "
+                        f"mode={mode} | "
+                        f"base={d['baseline_time']:.2f}h | "
+                        f"ml_delay={ml_delay:.2f}h | "
+                        f"status={status_reason} | "
+                        f"final={d['baseline_time'] + ml_delay:.2f}h"
+                    )
+
+                    u_parent = G_p.nodes[u].get("parent_city")
+                    v_parent = G_p.nodes[v].get("parent_city")
+                    u_ml = self.predictor.hub_map.get(u_parent, u_parent) if u_parent else None
+                    v_ml = self.predictor.hub_map.get(v_parent, v_parent) if v_parent else None
+                    pair_key = (u_ml, v_ml, mode) if (u_ml and v_ml) else None
+
+                    if status_reason == "applied" and pair_key in seen_ml_pairs:
+                        ml_delay = 0.0
+                        ml_result = None
+                        status_reason = "duplicate_pair"
+
+                    if status_reason == "applied" and pair_key:
+                        seen_ml_pairs.add(pair_key)
+
+                    l_time += ml_delay
+                    trace["eta"]["ml_p85"] += ml_delay
+
+                    if ml_result and status_reason == "applied":
+                        trace.setdefault("ml_predictions", []).append({
+                            "from": G_p.nodes[u].get("physical_id", u),
+                            "to": p_id,
+                            "origin_region": u_ml,
+                            "destination_region": v_ml,
+                            "status": "applied",
+                            "delay": round(ml_delay, 2),
+                            "p_quantile": ml_result.get("p_quantile"),
+                            "reason": ml_result.get("calibration_reason")
+                        })
+                    else:
+                        trace.setdefault("ml_predictions", []).append({
+                            "from": G_p.nodes[u].get("physical_id", u),
+                            "to": p_id,
+                            "status": "skipped",
+                            "reason": status_reason
+                        })
                     
                     if p_id in disruptions:
                         l_time += disruptions[p_id]["delay"]
                         l_threat = max(l_threat, disruptions[p_id]["threat"])
                         l_news = disruptions[p_id]["reason"]
                         l_source = "SCENARIO"
+                        scenario_cost = l_cost * 0.1
+                        l_cost += scenario_cost  # was only logged to trace before, never added to the real cost
                         trace["eta"]["scenario"] += disruptions[p_id]["delay"]
                         trace["risk"]["scenario"] = max(trace["risk"]["scenario"], l_threat)
-                        trace["cost"]["scenario"] += (l_cost * 0.1)
+                        trace["cost"]["scenario"] += scenario_cost
                     
                     if d["type"] == "transfer":
                         trace["eta"]["transfer"] += l_time
@@ -199,7 +303,10 @@ class RouteRecommender:
                     "total_cost": round(total_cost, 2),
                     "threat_level": round(max_threat, 2),
                     "audit_trace": trace,
-                    "explanation": self._generate_forensic_explanation(persona, trace, max_threat),
+                    "explanation": self._generate_forensic_explanation(
+                        persona, trace, max_threat,
+                        reference_cost=next((c["total_cost"] for c in candidates if c["persona"] == "FASTEST"), None)
+                    ),
                     "override_applied": bool(avoid_hubs or cost_ceiling < 999999)
                 })
 
@@ -226,7 +333,7 @@ class RouteRecommender:
             "recommendations": final[:3]
         }
 
-    def _generate_forensic_explanation(self, persona, trace, threat):
+    def _generate_forensic_explanation(self, persona, trace, threat, reference_cost=None):
         """
         Generates quantitative, decision-defensible explanations as required by TEST 5.
         """
@@ -239,4 +346,12 @@ class RouteRecommender:
         elif persona == "SAFEST":
              return f"Resilience-optimized. Path selection reduces risk exposure by {round((1.0 - threat)*100)}% by bypassing volatile corridors. Lead-time integrity prioritized over cost."
         else:
-             return f"Economic-optimized. Multimodal balance reduces total landed cost by {round(cost*0.15)}% vs premium express AIR, while maintaining defensible lead times."
+            # Was: round(cost * 0.15) -- an arbitrary number with no real relationship to
+            # "vs AIR", and mathematically could (and did) exceed 100%, which is impossible
+            # for a cost *reduction*. Now compares against the actual FASTEST/AIR persona's
+            # real total cost, computed earlier in the same recommend() call.
+            if reference_cost and reference_cost > 0 and cost < reference_cost:
+                savings_pct = round((1 - (cost / reference_cost)) * 100)
+                return f"Economic-optimized. Multimodal balance reduces total landed cost by {savings_pct}% vs premium express AIR, while maintaining defensible lead times."
+            else:
+                return f"Economic-optimized. Multimodal balance prioritizes total landed cost efficiency, while maintaining defensible lead times."
