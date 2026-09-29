@@ -4,6 +4,7 @@ import os
 import torch
 import json
 import time
+import re
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 
@@ -23,6 +24,20 @@ class ThreatIntelligencePredictor:
         self.model = None
         self.encoders = None
         self.profiles = {}
+        self.canonical_hub_map = {}
+
+        canonical_hubs_path = os.path.join(
+            os.path.dirname(__file__), "..", "data", "canonical_hubs.json"
+        )
+        try:
+            with open(canonical_hubs_path, "r") as f:
+                self.canonical_hub_map = {
+                    hub["id"]: hub.get("parent_city")
+                    for hub in json.load(f)
+                    if hub.get("id")
+                }
+        except (OSError, json.JSONDecodeError, TypeError):
+            self.canonical_hub_map = {}
         
         self.hub_map = {
             "Seattle": "Seattle Port", "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
@@ -63,10 +78,25 @@ class ThreatIntelligencePredictor:
         encoder = self.encoders[key]
         classes = list(encoder.classes_)
         if key in ["Origin_Node", "Destination_Node"]:
-            resolved = self.hub_map.get(value, value)
+            parent_city = self.canonical_hub_map.get(value)
+            resolved = self.hub_map.get(value, self.hub_map.get(parent_city, parent_city or value))
             if resolved in classes: return encoder.transform([resolved])[0]
+            raise ValueError(f"Unknown model hub: {value}")
         if value in classes: return encoder.transform([value])[0]
         return encoder.transform([classes[0]])[0]
+
+    def _fallback_prediction(self, transport_mode: str, reason: str) -> Dict[str, Any]:
+        priors = {"road": 2.5, "sea": 48.0, "air": 12.0, "rail": 18.0}
+        delay = priors.get(transport_mode.strip().lower(), 12.0)
+        return {
+            "raw_model_prediction": delay,
+            "calibrated_delay": delay,
+            "baseline_systemic_friction": delay,
+            "final_delay_presented": delay,
+            "calibration_reason": reason,
+            "p_quantile": 0.85,
+            "is_defensible": True
+        }
 
     def predict_worst_case_delay(self, origin: str, destination: str, transport_mode: str, 
                                  leg_type: str = "Global_Freight", condition_flag: str = "Clear", 
@@ -75,18 +105,9 @@ class ThreatIntelligencePredictor:
         Stage 4: p85 Quantile Prediction with Statistically Defensible Calibration.
         """
         if not self.is_trained:
-            mode_key = transport_mode.lower()
-            priors = {"road": 2.5, "sea": 48.0, "air": 12.0, "rail": 18.0}
-            delay = priors.get(mode_key, 12.0)
-            return {
-                "raw_model_prediction": delay,
-                "calibrated_delay": delay,
-                "baseline_systemic_friction": delay,
-                "final_delay_presented": delay,
-                "calibration_reason": "Deterministic Operational Prior (Engine Warming)",
-                "p_quantile": 0.85,
-                "is_defensible": True
-            }
+            return self._fallback_prediction(
+                transport_mode, "Deterministic Operational Prior (Engine Warming)"
+            )
 
         # t_ml_start = time.perf_counter()
         try:
@@ -133,14 +154,21 @@ class ThreatIntelligencePredictor:
                 "is_defensible": True
             }
             
+        except ValueError:
+            return self._fallback_prediction(
+                transport_mode, "Deterministic Operational Prior (Unknown Hub)"
+            )
         except Exception as e:
             print(f"Calibration Inference Error: {e}")
-            return {"final_delay_presented": 0.0, "calibration_reason": "Inference Error"}
+            return self._fallback_prediction(
+                transport_mode, "Deterministic Operational Prior (Inference Fallback)"
+            )
 
 class ContrastiveNLPEngine:
     """Stage 2: PRODUCTION Contrastive NLP Brain."""
     def __init__(self, lazy_load=False):
         self._ready = False
+        self.last_margin = None
         self.noise_floor = 0.04
         self.calibration_multiplier = 0.35
         if not lazy_load:
@@ -154,7 +182,7 @@ class ContrastiveNLPEngine:
             self.model = SentenceTransformer("all-MiniLM-L6-v2")
             self.util = util
             if os.path.exists(NLP_ANCHORS_PATH):
-                anchors = torch.load(NLP_ANCHORS_PATH)
+                anchors = torch.load(NLP_ANCHORS_PATH, map_location=torch.device("cpu"))
                 self.disaster_matrix = anchors["disaster_matrix"]
                 self.safe_matrix = anchors["safe_matrix"]
                 self._ready = True
@@ -174,24 +202,24 @@ class ContrastiveNLPEngine:
         d_scores = self.util.cos_sim(chunk_embeddings, self.disaster_matrix)
         s_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
         margin = float(np.max(d_scores.cpu().numpy())) - float(np.max(s_scores.cpu().numpy()))
-        if margin >= self.noise_floor: return 0.0
+        self.last_margin = margin
+        if margin < self.noise_floor: return 0.0
         return float(min(1.0, margin * self.calibration_multiplier))
 
 class CARFFilter:
     """Stage 3: TRUE CARF (Context-Aware Relevance Filter)."""
     def __init__(self):
-        self.relevance_map = {"air": ["airport", "flight", "airspace", "aviation", "sky", "terminal"],
+        self.relevance_map = {"air": ["airport", "airports", "flight", "flights", "airspace", "aviation", "sky", "terminal", "terminals"],
                               "sea": ["port", "vessel", "ship", "canal", "ocean", "maritime", "dock"],
-                              "rail": ["rail", "track", "locomotive", "station"],
+                      "rail": ["rail", "railway", "railways", "track", "tracks", "locomotive", "locomotives", "station", "stations"],
                               "road": ["highway", "truck", "traffic", "bridge", "road", "delivery"]}
 
     def apply_filter(self, semantic_score: float, news_context: str, transport_mode: str) -> float:
         if semantic_score <= 0: return 0.0
-        news_words = news_context.lower().split()
-        if transport_mode == "sea" and any(kw in news_words for kw in ["port", "vessel", "canal", "ocean", "maritime"]):
-            if not any(kw in news_words for kw in ["airport", "flight"]): return 0.0
-        if transport_mode == "air" and any(kw in news_words for kw in ["airport", "flight"]):
-            if not any(kw in news_words for kw in ["port", "vessel", "maritime"]): return 0.0
+        news_words = set(re.findall(r"[a-z0-9]+", news_context.lower()))
+        mode_keywords = self.relevance_map.get(transport_mode.strip().lower(), [])
+        if mode_keywords and not any(keyword in news_words for keyword in mode_keywords):
+            return 0.0
         return semantic_score
 
     def max_pool_threats(self, scores: List[float]) -> float:

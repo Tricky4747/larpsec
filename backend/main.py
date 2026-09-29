@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, Query
+from fastapi import FastAPI, WebSocket, Query, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 import asyncio
@@ -109,8 +109,22 @@ def get_network():
 
 @app.get("/api/status")
 def get_status():
+    if recommender.warmup_failed:
+        engine_status = "WARM-UP FAILED"
+    elif not recommender.is_warmed_up:
+        engine_status = "WARMING RISK ENGINE"
+    elif not recommender.predictor.is_trained or not recommender.nlp._ready:
+        engine_status = "DEGRADED FALLBACK MODE"
+    else:
+        engine_status = "FULLY OPERATIONAL"
+
     return {
-        "ml_trained": True,
+        "ml_trained": recommender.predictor.is_trained,
+        "nlp_ready": recommender.nlp._ready,
+        "warmup_complete": recommender.is_warmed_up,
+        "warmup_failed": recommender.warmup_failed,
+        "engine_status": engine_status,
+        "live_news_enabled": recommender.live_news_enabled,
         "active_trips": len(simulator.active_trips),
         "tick": simulator.time_tick,
         "is_supplychainer": True,
@@ -127,12 +141,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 status_msg = "WARM-UP FAILED"
             elif not recommender.is_warmed_up:
                 status_msg = "WARMING RISK ENGINE"
+            elif not recommender.predictor.is_trained or not recommender.nlp._ready:
+                status_msg = "DEGRADED FALLBACK MODE"
             else:
                 status_msg = "FULLY OPERATIONAL"
                 
             state = {
                 "tick": simulator.time_tick,
-                "ml_trained": True,
+                "ml_trained": recommender.predictor.is_trained,
+                "nlp_ready": recommender.nlp._ready,
                 "engine_status": status_msg,
                 "hub_registry": "Synchronized"
             }
@@ -152,6 +169,11 @@ def get_cities():
 
 @app.post("/api/recommend")
 def recommend_routes(req: RecommendRequest):
+    if recommender.warmup_failed:
+        raise HTTPException(status_code=503, detail="Risk engine warm-up failed")
+    if not DEMO_MODE and not recommender.is_warmed_up:
+        raise HTTPException(status_code=503, detail="Risk engine is still warming up")
+
     result = recommender.recommend(
         source=req.source,
         destination=req.destination,

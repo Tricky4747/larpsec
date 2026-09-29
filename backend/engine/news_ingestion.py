@@ -1,7 +1,7 @@
 import feedparser
 import urllib.parse
+import urllib.request
 import time
-import socket
 from typing import List, Dict
 
 class DynamicNewsIngestor:
@@ -26,37 +26,52 @@ class DynamicNewsIngestor:
         """
         Fetches live news for a specific geographic node and transport mode.
         """
-        query = f"{location} {transport_mode} logistics disruption"
+        location = location.strip() if location else location
+        normalized_mode = transport_mode.strip().lower()
+        mode_terms = {
+            "sea": "maritime",
+            "air": "aviation cargo",
+            "road": "highway",
+            "rail": "rail freight",
+        }
+        query_mode = mode_terms.get(normalized_mode, normalized_mode)
+        query = f"{location} {query_mode} logistics disruption"
         
         # 1. Check Cache
         now = time.time()
         if query in self.cache:
             ts, content = self.cache[query]
             if now - ts < self.cache_ttl:
+                print(f"[TRACE] News cache used: location={location} mode={normalized_mode}")
                 return content
 
         # 2. Live Ingestion (Google News RSS)
         t_start = time.perf_counter()
-        print(f"[TRACE] STEP 7: News ingestion started for {location}")
+        print(f"[TRACE] STEP 7: News fetch started: location={location} mode={normalized_mode}")
         try:
             encoded_query = urllib.parse.quote(query)
             rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
             
-            # Set a hard timeout for the socket
-            socket.setdefaulttimeout(2.0)
-            
-            feed = feedparser.parse(rss_url)
+            with urllib.request.urlopen(rss_url, timeout=2.0) as response:
+                feed = feedparser.parse(response)
             
             if feed.entries:
                 top_headlines = [entry.title for entry in feed.entries[:3]]
                 content = " | ".join(top_headlines)
                 self.cache[query] = (now, content)
-                print(f"[TRACE] STEP 8: News ingestion complete ({time.perf_counter()-t_start:.4f}s)")
+                print(
+                    f"[TRACE] STEP 8: News fetched: location={location} "
+                    f"mode={normalized_mode} headlines={len(top_headlines)} "
+                    f"duration={time.perf_counter()-t_start:.4f}s"
+                )
                 return content
+
+            print(f"[TRACE] STEP 8: News fallback used: location={location} mode={normalized_mode}")
+            return self.fallback_news.get(normalized_mode, "Normal operational conditions reported.")
             
         except Exception as e:
-            print(f"[TRACE] News ingestion error for {query}: {e}")
+            print(f"[TRACE] News fetch failed: location={location} mode={normalized_mode} error={e}")
             
         # 3. Defensive Fallback
-        print(f"[TRACE] STEP 8: News ingestion complete (Fallback used)")
-        return self.fallback_news.get(transport_mode.lower(), "Normal operational conditions reported.")
+        print(f"[TRACE] STEP 8: News fallback used: location={location} mode={normalized_mode}")
+        return self.fallback_news.get(normalized_mode, "Normal operational conditions reported.")

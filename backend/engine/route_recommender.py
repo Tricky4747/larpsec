@@ -1,6 +1,7 @@
 import networkx as nx
 import math
 import time
+import os
 from typing import List, Dict, Any, Optional
 from .multimodal_network import MODE_PROFILES, create_multimodal_network
 from .threat_intelligence import ThreatIntelligencePredictor, ContrastiveNLPEngine, CARFFilter
@@ -25,6 +26,9 @@ class RouteRecommender:
         self.nlp = ContrastiveNLPEngine(lazy_load=True)
         self.carf = CARFFilter()
         self.news_ingestor = DynamicNewsIngestor()
+        self.live_intelligence_cache = {}
+        self.live_news_enabled = os.getenv("LIVE_NEWS_ENABLED", "false").lower() == "true"
+        self.live_news_fetch_budget = int(os.getenv("LIVE_NEWS_FETCH_BUDGET", "12"))
         self.resolver = NodeResolver()
         
         print(f"[STARTUP] Initializing Split-Node Global Topology...")
@@ -84,6 +88,8 @@ class RouteRecommender:
         
         # 3. Persona Optimization
         candidates = []
+        delay_cache = {}
+        live_fetch_state = {"count": 0}
         for persona in ["FASTEST", "SAFEST", "BALANCED"]:
             try:
                 # Build Persona Graph (Applying STRICT constraints)
@@ -93,6 +99,15 @@ class RouteRecommender:
                 for hub_id in avoid_hubs:
                     nodes_to_remove = [n for n, d in G_p.nodes(data=True) if d.get("physical_id") == hub_id]
                     G_p.remove_nodes_from(nodes_to_remove)
+
+                if scenario == "SUEZ_BLOCK":
+                    affected_nodes = set(disruptions)
+                    blocked_edges = [
+                        (u, v)
+                        for u, v, d in G_p.edges(data=True)
+                        if G_p.nodes[v].get("physical_id") in affected_nodes
+                    ]
+                    G_p.remove_edges_from(blocked_edges)
                 
                 # Apply Transport Preference
                 if transport_preference != "any" and routing_policy == "STRICT":
@@ -103,6 +118,9 @@ class RouteRecommender:
                             edges_to_remove.append((u, v))
                     G_p.remove_edges_from(edges_to_remove)
 
+                live_edge_threats = {}
+                predicted_edge_delays = {}
+
                 def weight_func(u, v, d):
                     mode = d["transport_mode"]
                     base_t = d["baseline_time"]
@@ -112,12 +130,31 @@ class RouteRecommender:
                     v_data = G_p.nodes[v]
                     p_id = v_data.get("physical_id")
                     
-                    threat = d.get("base_threat", 0.05)
+                    threat = live_edge_threats.get((u, v), d.get("base_threat", 0.05))
                     delay = 0
                     
                     if p_id in disruptions:
                         threat = max(threat, disruptions[p_id]["threat"])
                         delay += disruptions[p_id]["delay"]
+
+                    predicted_delay = 0.0
+                    if d.get("type") != "transfer":
+                        origin_id = G_p.nodes[u].get("physical_id", u)
+                        condition = "Disrupted" if p_id in disruptions else "Clear"
+                        prediction_key = (
+                            origin_id, p_id, mode, condition, round(threat, 6)
+                        )
+                        if prediction_key not in delay_cache:
+                            delay_cache[prediction_key] = self.predictor.predict_worst_case_delay(
+                                origin_id,
+                                p_id,
+                                mode,
+                                condition_flag=condition,
+                                nlp_score=threat,
+                            ).get("final_delay_presented", 0.0)
+                        predicted_delay = delay_cache[prediction_key]
+                        predicted_edge_delays[(u, v)] = predicted_delay
+                    delay += predicted_delay
                     
                     if persona == "FASTEST":
                         return base_t + delay
@@ -132,6 +169,35 @@ class RouteRecommender:
                         return (base_t + delay)*time_weight + (base_c / 150.0)*cost_weight + (threat * 40.0)*risk_weight
 
                 path = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=weight_func)
+
+                # Enrich and reroute until the live-scored corridor stabilizes.
+                last_scored_path = path
+                path_stable = False
+                for _ in range(3):
+                    previous_path = path
+                    for i in range(len(path) - 1):
+                        u, v = path[i], path[i + 1]
+                        d = G_p[u][v]
+                        if d["type"] == "transfer" or not self.live_news_enabled:
+                            continue
+                        v_data = G_p.nodes[v]
+                        _, live_threat, _ = self._get_live_intelligence(
+                            v_data.get("display_name", v_data.get("physical_id", v)),
+                            d["transport_mode"],
+                            live_fetch_state,
+                        )
+                        live_edge_threats[(u, v)] = max(
+                            d.get("base_threat", 0.05), live_threat
+                        )
+
+                    last_scored_path = previous_path
+                    path = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=weight_func)
+                    if path == previous_path:
+                        path_stable = True
+                        break
+
+                if not path_stable:
+                    path = last_scored_path
                 
                 # Compose Multimodal Path Details
                 legs = []
@@ -149,7 +215,7 @@ class RouteRecommender:
                     v_data = G_p.nodes[v]
                     p_id = v_data.get("physical_id")
                     
-                    l_time = d["baseline_time"]
+                    l_time = d["baseline_time"] + predicted_edge_delays.get((u, v), 0.0)
                     l_cost = d.get("cost", 0)
                     l_threat = d.get("base_threat", 0.05)
                     l_news = d.get("base_news", "Standard conditions")
@@ -163,6 +229,13 @@ class RouteRecommender:
                         trace["eta"]["scenario"] += disruptions[p_id]["delay"]
                         trace["risk"]["scenario"] = max(trace["risk"]["scenario"], l_threat)
                         trace["cost"]["scenario"] += (l_cost * 0.1)
+                    elif d["type"] != "transfer" and self.live_news_enabled:
+                        live_news, live_threat, live_source = self._get_live_intelligence(
+                            v_data.get("display_name", p_id), mode, live_fetch_state
+                        )
+                        l_news = live_news
+                        l_threat = max(l_threat, live_threat)
+                        l_source = live_source
                     
                     if d["type"] == "transfer":
                         trace["eta"]["transfer"] += l_time
@@ -225,6 +298,37 @@ class RouteRecommender:
             "active_scenario": active_scenario["name"] if active_scenario else None,
             "recommendations": final[:3]
         }
+
+    def _get_live_intelligence(self, location, mode, fetch_state=None):
+        cache_key = (location, mode.lower())
+        now = time.time()
+        cached = self.live_intelligence_cache.get(cache_key)
+        if cached and now - cached[0] < self.news_ingestor.cache_ttl:
+            return cached[1:]
+
+        if fetch_state is not None and fetch_state["count"] >= self.live_news_fetch_budget:
+            fallback = self.news_ingestor.fallback_news.get(
+                mode.lower(), "Normal operational conditions reported."
+            )
+            return fallback, 0.0, "FALLBACK"
+
+        if fetch_state is not None:
+            fetch_state["count"] += 1
+
+        news = self.news_ingestor.get_latest_news(location, mode)
+        score = self.nlp.get_semantic_score(news)
+        threat = self.carf.apply_filter(score, news, mode)
+        fallback = self.news_ingestor.fallback_news.get(
+            mode.lower(), "Normal operational conditions reported."
+        )
+        source = "FALLBACK" if news == fallback else "LIVE_NEWS"
+        print(
+            f"[TRACE] Live intelligence scored: location={location} mode={mode.lower()} "
+            f"source={source} margin={self.nlp.last_margin!r} "
+            f"semantic={score:.4f} carf={threat:.4f}"
+        )
+        self.live_intelligence_cache[cache_key] = (now, news, threat, source)
+        return news, threat, source
 
     def _generate_forensic_explanation(self, persona, trace, threat):
         """
