@@ -80,17 +80,21 @@ class RouteRecommender:
         active_scenario = self.scenario_mgr.activate_scenario(scenario)
         disruptions = self.scenario_mgr.get_active_disruptions()
         
+        G_base = self.unified_graph.copy()
+        for hub_id in avoid_hubs:
+            G_base.remove_nodes_from([n for n, d in G_base.nodes(data=True)
+                                      if d.get("physical_id") == hub_id])
+        refs = {
+            "air":     self._reference_route(G_base, s_vnode, d_vnode, ["air", "transfer", "road"], disruptions),
+            "surface": self._reference_route(G_base, s_vnode, d_vnode, ["sea", "rail", "road", "transfer"], disruptions),
+        }
+        
         # 3. Persona Optimization
         candidates = []
         for persona in ["FASTEST", "SAFEST", "BALANCED"]:
             try:
                 # Build Persona Graph (Applying STRICT constraints)
-                G_p = self.unified_graph.copy()
-                
-                # Apply Hub Avoidance (Prune all virtual nodes for the hub)
-                for hub_id in avoid_hubs:
-                    nodes_to_remove = [n for n, d in G_p.nodes(data=True) if d.get("physical_id") == hub_id]
-                    G_p.remove_nodes_from(nodes_to_remove)
+                G_p = G_base.copy()
                 
                 # Apply Transport Preference
                 if transport_preference != "any" and routing_policy == "STRICT":
@@ -185,8 +189,8 @@ class RouteRecommender:
                         "to_name": v_data.get("display_name", p_id),
                         "mode": mode.upper(),
                         "type": d["type"],
-                        "eta": round(l_time, 1),
-                        "cost": round(l_cost, 2),
+                        "eta": round(l_time + l_delay, 1),        # was: round(l_time, 1)
+                        "cost": round(l_cost + l_premium, 2),     # was: round(l_cost, 2)
                         "threat": round(l_threat, 2),
                         "reason": l_news,
                         "intel_source": l_source
@@ -202,7 +206,6 @@ class RouteRecommender:
                     "total_cost": round(total_cost, 2),
                     "threat_level": round(max_threat, 2),
                     "audit_trace": trace,
-                    "explanation": self._generate_forensic_explanation(persona, trace, max_threat),
                     "override_applied": bool(avoid_hubs or cost_ceiling < 999999)
                 })
 
@@ -222,23 +225,75 @@ class RouteRecommender:
             if path_sig not in seen:
                 final.append(c)
                 seen.add(path_sig)
+        peer_threats = [c["threat_level"] for c in final]
+        for c in final:
+            c["explanation"] = self._generate_forensic_explanation(
+                c["persona"], c["audit_trace"], c["threat_level"], c["legs"], refs, peer_threats)
         return {
             "origin": source, "destination": destination,
             "active_scenario": active_scenario["name"] if active_scenario else None,
             "recommendations": final[:3]
         }
 
-    def _generate_forensic_explanation(self, persona, trace, threat):
-        """
-        Generates quantitative, decision-defensible explanations as required by TEST 5.
-        """
+    def _reference_route(self, G, s_vnode, d_vnode, allowed_modes, disruptions):
+        """Single-mode baseline (pure AIR / pure surface) for explanations. None if no route."""
+        G_ref = G.copy()
+        G_ref.remove_edges_from([(u, v) for u, v, d in G_ref.edges(data=True)
+                                 if d["transport_mode"] not in allowed_modes])
+        try:
+            path = nx.dijkstra_path(G_ref, s_vnode, d_vnode, weight="baseline_time")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None
+
+        eta = cost = 0.0
+        for u, v in zip(path, path[1:]):
+            d = G_ref[u][v]
+            leg_t, leg_c = d["baseline_time"], d.get("cost", 0.0)
+            hit = disruptions.get(G_ref.nodes[v].get("physical_id"))
+            if hit:
+                leg_t += hit["delay"]
+                leg_c += leg_c * 0.1
+            eta += leg_t
+            cost += leg_c
+        return {"eta": round(eta, 1), "cost": round(cost, 2)}
+
+    def _generate_forensic_explanation(self, persona, trace, threat, legs, refs, peer_threats):
         eta = trace["eta"]["transit"] + trace["eta"]["transfer"] + trace["eta"]["scenario"]
         cost = trace["cost"]["transit"] + trace["cost"]["transfer"] + trace["cost"]["scenario"]
-        transfer_count = round(trace["eta"]["transfer"] / 4.0) # Approx transfers
-        
+        transfer_count = sum(1 for l in legs if l["type"] == "transfer")
+
         if persona == "FASTEST":
-            return f"Velocity-optimized. Mode handoffs applied to reduce transit time by {round(trace['eta']['transit']*0.2, 1)}h vs pure surface transport. {transfer_count} strategic transfers enforced."
-        elif persona == "SAFEST":
-             return f"Resilience-optimized. Path selection reduces risk exposure by {round((1.0 - threat)*100)}% by bypassing volatile corridors. Lead-time integrity prioritized over cost."
+            ref = refs["surface"]
+            if ref and ref["eta"] > eta:
+                claim = f"Arrives {round(ref['eta'] - eta, 1)}h sooner than the fastest surface-only alternative."
+            elif ref:
+                claim = f"Matches the surface-only alternative within {round(abs(ref['eta'] - eta), 1)}h."
+            else:
+                claim = "No surface-only alternative exists for this lane."
+            return (f"Velocity-optimized. {claim} {transfer_count} strategic transfer(s) "
+                    f"totalling {round(trace['eta']['transfer'], 1)}h.")
+
+        if persona == "SAFEST":
+            worse = [t for t in peer_threats if t > threat]
+            if worse:
+                peak = max(worse)
+                claim = (f"Holds threat exposure {round((peak - threat) / peak * 100)}% below the "
+                         f"{round(peak * 100)}% ceiling of the alternatives evaluated.")
+            else:
+                claim = (f"Ties the lowest threat exposure of the alternatives evaluated "
+                         f"at {round(threat * 100)}%.")
+            return f"Resilience-optimized. {claim} Lead-time integrity prioritized over cost."
+
+        ref = refs["air"]
+        if ref and ref["cost"] > 0:
+            delta = (ref["cost"] - cost) / ref["cost"] * 100
+            claim = (f"Lands {round(delta)}% below the air-only alternative (${round(ref['cost'] - cost)} saved)."
+                     if delta >= 0 else
+                     f"Priced {round(-delta)}% above the air-only alternative (${round(cost - ref['cost'])} premium).")
+        elif ref:
+            claim = "Air-only alternative priced at zero; no cost basis to compare."
         else:
-             return f"Economic-optimized. Multimodal balance reduces total landed cost by {round(cost*0.15)}% vs premium express AIR, while maintaining defensible lead times."
+            claim = "No air-only alternative exists for this lane."
+        scen = (f" Scenario adds ${round(trace['cost']['scenario'])} and {round(trace['eta']['scenario'])}h."
+                if trace["cost"]["scenario"] or trace["eta"]["scenario"] else "")
+        return f"Economic-optimized. {claim} Lead time {round(eta, 1)}h at ${round(cost)} landed.{scen}"
