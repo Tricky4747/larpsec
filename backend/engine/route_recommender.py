@@ -6,7 +6,6 @@ from .multimodal_network import MODE_PROFILES, create_multimodal_network
 from .threat_intelligence import ThreatIntelligencePredictor, ContrastiveNLPEngine, CARFFilter
 from .news_ingestion import DynamicNewsIngestor
 from .node_resolver import NodeResolver
-
 class RouteRecommender:
     """
     Supplychainer Unified Multimodal Optimization Engine.
@@ -62,7 +61,6 @@ class RouteRecommender:
                   routing_policy: str = "STRICT", cargo_type: str = "general", 
                   priority: str = "normal", scenario: str = None, 
                   overrides: dict = None) -> dict:
-        
         t0 = time.perf_counter()
         overrides = overrides or {}
         avoid_hubs = overrides.get("avoid_chokepoints", [])
@@ -149,21 +147,16 @@ class RouteRecommender:
                     v_data = G_p.nodes[v]
                     p_id = v_data.get("physical_id")
                     
-                    l_time = d["baseline_time"]
-                    l_cost = d.get("cost", 0)
-                    l_threat = d.get("base_threat", 0.05)
-                    l_news = d.get("base_news", "Standard conditions")
-                    l_source = "FALLBACK"
-                    
                     if p_id in disruptions:
-                        l_time += disruptions[p_id]["delay"]
+                        l_delay = disruptions[p_id]["delay"]
+                        l_premium = l_cost * 0.1
                         l_threat = max(l_threat, disruptions[p_id]["threat"])
                         l_news = disruptions[p_id]["reason"]
                         l_source = "SCENARIO"
-                        trace["eta"]["scenario"] += disruptions[p_id]["delay"]
+                        trace["eta"]["scenario"] += l_delay
+                        trace["cost"]["scenario"] += l_premium
                         trace["risk"]["scenario"] = max(trace["risk"]["scenario"], l_threat)
-                        trace["cost"]["scenario"] += (l_cost * 0.1)
-                    
+
                     if d["type"] == "transfer":
                         trace["eta"]["transfer"] += l_time
                         trace["cost"]["transfer"] += l_cost
@@ -172,9 +165,10 @@ class RouteRecommender:
                         trace["cost"]["transit"] += l_cost
                         trace["risk"]["baseline"] = max(trace["risk"]["baseline"], l_threat)
 
-                    total_time += l_time
-                    total_cost += l_cost
+                    total_time += l_time + l_delay
+                    total_cost += l_cost + l_premium
                     max_threat = max(max_threat, l_threat)
+                    
                     
                     legs.append({
                         "from": G_p.nodes[u].get("physical_id", u),
@@ -219,7 +213,6 @@ class RouteRecommender:
             if path_sig not in seen:
                 final.append(c)
                 seen.add(path_sig)
-
         return {
             "origin": source, "destination": destination,
             "active_scenario": active_scenario["name"] if active_scenario else None,
