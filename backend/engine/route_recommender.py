@@ -147,6 +147,14 @@ class RouteRecommender:
                     v_data = G_p.nodes[v]
                     p_id = v_data.get("physical_id")
                     
+                    l_time = d["baseline_time"]
+                    l_cost = d.get("cost", 0)
+                    l_delay = 0.0
+                    l_premium = 0.0
+                    l_threat = d.get("base_threat", 0.05)
+                    l_news = d.get("base_news", "Standard conditions")
+                    l_source = "FALLBACK"
+
                     if p_id in disruptions:
                         l_delay = disruptions[p_id]["delay"]
                         l_premium = l_cost * 0.1
@@ -168,6 +176,7 @@ class RouteRecommender:
                     total_time += l_time + l_delay
                     total_cost += l_cost + l_premium
                     max_threat = max(max_threat, l_threat)
+                    
                     
                     
                     legs.append({
