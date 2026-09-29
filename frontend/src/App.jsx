@@ -2,13 +2,20 @@ import React, { useState, useEffect } from 'react';
 import BenchmarkCharts from './BenchmarkCharts.jsx';
 import RouteRecommender from './RouteRecommender.jsx';
 import SupplierIntelligence from './SupplierIntelligence.jsx';
+import NetworkMap from './NetworkMap.jsx';
 
 export default function App() {
   const [network, setNetwork] = useState({ nodes: [], edges: [] });
+  const [hubs, setHubs] = useState([]);
+  const [routeForMap, setRouteForMap] = useState(null);
   const [status, setStatus] = useState(null);
   const [currentView, setCurrentView] = useState('recommend');
   
   useEffect(() => {
+    fetch('/api/hubs')
+      .then(r => r.json())
+      .then(data => setHubs(data))
+      .catch(e => console.error(e));
     fetch('/api/network')
       .then(r => r.json())
       .then(data => setNetwork(data))
@@ -26,7 +33,10 @@ export default function App() {
   }, []);
 
   if (currentView === 'recommend') {
-    return <RouteRecommender onNavigate={setCurrentView} />;
+                  return <RouteRecommender
+                    onNavigate={setCurrentView}
+                    onRouteGenerated={setRouteForMap}
+                  />;
   }
 
   if (currentView === 'suppliers') {
@@ -36,7 +46,7 @@ export default function App() {
   if (currentView === 'benchmark') {
     return <BenchmarkCharts onBack={() => setCurrentView('recommend')} />;
   }
-
+  if (currentView === 'network') {
   return (
     <div className="dashboard-container">
       {/* GLOBAL LOGISTICS CONSOLE (Simulator View) */}
@@ -66,7 +76,7 @@ export default function App() {
           <button className="benchmark-btn" onClick={() => setCurrentView('benchmark')}>
             View Scientific Benchmarks
           </button>
-          <button className="dispatch-btn" style={{marginTop: '0.75rem', backgroundColor: '#8b5cf6'}} onClick={() => setCurrentView('suppliers')}>
+          <button className="dispatch-btn" style={{ backgroundColor: '#8b5cf6'}} onClick={() => setCurrentView('suppliers')}>
             Execute Supplier Intelligence Audit
           </button>
         </div>
@@ -74,13 +84,14 @@ export default function App() {
 
       {/* CENTER PANEL - GLOBAL SCOPE */}
       <div className="panel" style={{padding: 0, overflow: 'hidden'}}>
-        <div className="map-container" style={{display: 'flex', alignItems: 'center', justifyContent: 'center'}}>
-           <div style={{textAlign: 'center', color: 'var(--text-muted)'}}>
-             <h3 style={{color: 'white', marginBottom: '1rem'}}>Global Supply Chain Core</h3>
-             <p>Analyzing {network.nodes.length} Strategic Logistics Hubs</p>
-             <p>Live RSS Ingestion Active for all transit corridors.</p>
-           </div>
-        </div>
+        <div
+            className="map-container"
+            style={{ position: 'relative' }}
+       >
+        
+
+  <NetworkMap hubs={hubs} route={routeForMap} />
+</div>
       </div>
 
       {/* RIGHT PANEL - TRUTH AUDIT */}
@@ -107,4 +118,5 @@ export default function App() {
       </div>
     </div>
   );
+}
 }
