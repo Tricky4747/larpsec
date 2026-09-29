@@ -174,7 +174,7 @@ class ContrastiveNLPEngine:
         d_scores = self.util.cos_sim(chunk_embeddings, self.disaster_matrix)
         s_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
         margin = float(np.max(d_scores.cpu().numpy())) - float(np.max(s_scores.cpu().numpy()))
-        if margin >= self.noise_floor: return 0.0
+        if margin < self.noise_floor: return 0.0
         return float(min(1.0, margin * self.calibration_multiplier))
 
 class CARFFilter:
