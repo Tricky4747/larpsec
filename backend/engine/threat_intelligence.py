@@ -6,6 +6,7 @@ import json
 import time
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
+import re  # add to the imports at the top
 
 # Load Production Artifacts
 MODEL_PATH = "./Execution/risk_model.pkl"
@@ -174,6 +175,7 @@ class ContrastiveNLPEngine:
         d_scores = self.util.cos_sim(chunk_embeddings, self.disaster_matrix)
         s_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
         margin = float(np.max(d_scores.cpu().numpy())) - float(np.max(s_scores.cpu().numpy()))
+        # bug 1 fix
         if margin < self.noise_floor: return 0.0
         return float(min(1.0, margin * self.calibration_multiplier))
 
@@ -185,13 +187,28 @@ class CARFFilter:
                               "rail": ["rail", "track", "locomotive", "station"],
                               "road": ["highway", "truck", "traffic", "bridge", "road", "delivery"]}
 
+
     def apply_filter(self, semantic_score: float, news_context: str, transport_mode: str) -> float:
-        if semantic_score <= 0: return 0.0
-        news_words = news_context.lower().split()
-        if transport_mode == "sea" and any(kw in news_words for kw in ["port", "vessel", "canal", "ocean", "maritime"]):
-            if not any(kw in news_words for kw in ["airport", "flight"]): return 0.0
-        if transport_mode == "air" and any(kw in news_words for kw in ["airport", "flight"]):
-            if not any(kw in news_words for kw in ["port", "vessel", "maritime"]): return 0.0
+        if semantic_score <= 0:
+            return 0.0
+
+        mode = transport_mode.lower()
+        own_keywords = self.relevance_map.get(mode)
+        if not own_keywords:
+            return semantic_score  # unknown mode: don't filter
+
+        words = set(re.findall(r"[a-z]+", news_context.lower()))
+
+        matches_own = bool(words & set(own_keywords))
+        matches_other = any(
+            words & set(kws)
+            for m, kws in self.relevance_map.items()
+            if m != mode
+        )
+
+        # Suppress only if the news is about another mode and not this one
+        if matches_other and not matches_own:
+            return 0.0
         return semantic_score
 
     def max_pool_threats(self, scores: List[float]) -> float:
