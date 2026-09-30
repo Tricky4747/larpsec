@@ -38,28 +38,48 @@ class RouteRecommender:
     def __init__(
         self,
         unified_graph=None,
-        scenario_mgr=None,
         predictor=None,
+        simulator=None,
+        scenario_mgr=None,
+        demo_mode: bool = False,
         resolver=None,
         live_news_enabled: Optional[bool] = None,
         live_news_fetch_budget: Optional[int] = None,
+        **kwargs,
     ):
+        # Disambiguate legacy positional parameter ordering (unified_graph, scenario_mgr, predictor, resolver) vs
+        # (unified_graph, predictor, simulator, scenario_mgr, demo_mode=...)
+        if (
+            hasattr(predictor, "activate_scenario")
+            or hasattr(predictor, "get_active_disruptions")
+        ) and (
+            hasattr(scenario_mgr, "predict_worst_case_delay")
+            or hasattr(unified_graph, "predict_worst_case_delay")
+        ):
+            old_scen = predictor
+            old_pred = scenario_mgr
+            predictor = old_pred
+            scenario_mgr = old_scen
+
         self.unified_graph = unified_graph
         if self.unified_graph is None:
             try:
                 self.unified_graph = create_multimodal_network()
-            except TypeError:
-                # Some versions expose the network builder with no usable
-                # zero-argument constructor. Keep initialization explicit.
+            except Exception:
                 self.unified_graph = None
 
         self.predictor = predictor or ThreatIntelligencePredictor()
+        self.simulator = simulator
         self.resolver = resolver or NodeResolver()
 
         self.nlp = ContrastiveNLPEngine(lazy_load=True)
         self.carf = CARFFilter()
         self.news_ingestor = DynamicNewsIngestor()
         self.live_intelligence_cache = {}
+
+        self.demo_mode = bool(demo_mode or kwargs.get("demo_mode", False))
+        self.is_warmed_up = self.demo_mode
+        self.warmup_failed = False
 
         self.live_news_enabled = (
             os.getenv("LIVE_NEWS_ENABLED", "false").lower() == "true"
@@ -86,6 +106,33 @@ class RouteRecommender:
                     self.scenario_mgr = ScenarioManager()
                 except TypeError:
                     self.scenario_mgr = ScenarioManager(self.unified_graph)
+
+    def run_background_warmup(self):
+        if self.is_warmed_up:
+            return
+        print("[WARMUP] Calibrating global threat floor...")
+        try:
+            if self.predictor:
+                self.predictor.warmup()
+            if self.nlp:
+                self.nlp.warmup()
+
+            if self.unified_graph:
+                for u, v, d in self.unified_graph.edges(data=True):
+                    mode = d.get("transport_mode", "road")
+                    if mode == "transfer":
+                        continue
+                    news = self.news_ingestor.fallback_news.get(mode, "Normal conditions.")
+                    score = self.nlp.get_semantic_score(news)
+                    threat = self.carf.apply_filter(score, news, mode)
+                    self.unified_graph[u][v]["base_threat"] = threat
+                    self.unified_graph[u][v]["base_news"] = news
+
+            self.is_warmed_up = True
+            print("[WARMUP] Unified Calibration Complete.")
+        except Exception as e:
+            print(f"[WARMUP] Error during warmup: {e}")
+            self.warmup_failed = True
 
     def _get_live_intelligence(self, location, mode, fetch_state=None):
         """Fetch, NLP-score and CARF-filter live news with bounded requests."""
@@ -442,21 +489,33 @@ class RouteRecommender:
                     legs.append(
                         {
                             "from": G_p.nodes[u].get(
+                                "physical_id", u
+                            ),
+                            "from_name": G_p.nodes[u].get(
                                 "display_name",
                                 G_p.nodes[u].get("physical_id", u),
                             ),
                             "to": v_data.get(
+                                "physical_id", v
+                            ),
+                            "to_name": v_data.get(
                                 "display_name",
                                 v_data.get("physical_id", v),
                             ),
+                            "mode": mode,
                             "transport_mode": mode,
+                            "type": data.get("type", "transfer" if mode == "transfer" else "transit"),
                             "baseline_time": round(float(data["baseline_time"]), 2),
                             "predicted_delay": round(predicted_delay, 2),
+                            "eta": round(leg_time, 2),
                             "time": round(leg_time, 2),
                             "cost": round(leg_cost, 2),
+                            "threat": round(leg_threat, 4),
                             "threat_level": round(leg_threat, 4),
                             "news": leg_news,
+                            "reason": leg_news,
                             "news_source": leg_source,
+                            "intel_source": leg_source,
                         }
                     )
 
@@ -502,11 +561,15 @@ class RouteRecommender:
             candidate for candidate in candidates if "error" not in candidate
         ]
 
+        if not valid_candidates:
+            first_err = next((c["error"] for c in candidates if "error" in c), "No valid multimodal route found under current strategic constraints.")
+            return {"error": f"No feasible route: {first_err}"}
+
         return {
             "source": source,
             "destination": destination,
             "active_scenario": active_scenario,
-            "recommendations": candidates,
+            "recommendations": valid_candidates,
             # Keep the compact alias used by the UI/sample response format.
             "personas": valid_candidates,
             "meta": {

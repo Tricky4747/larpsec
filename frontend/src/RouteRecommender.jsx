@@ -61,6 +61,11 @@ fetch('/api/scenarios')
 }, []);
 
 const getRecommendations = async () => {
+  if (!source || !destination) {
+    setError('Please search and select both an Origin Hub and Destination Hub.');
+    return;
+  }
+
   setLoading(true);
   setError(null);
   setImpact(null);
@@ -89,31 +94,40 @@ const getRecommendations = async () => {
   try {
     const { ok, data } = await requestRoutes(scenarioId);
 
-    if (!ok || data.error || !data.recommendations) {
-      setError(data.error || data.detail || 'Engine unavailable, try again shortly.');
+    const validRecs = Array.isArray(data.recommendations)
+      ? data.recommendations.filter(r => r && !r.error && Array.isArray(r.legs))
+      : [];
+
+    if (!ok || data.error || validRecs.length === 0) {
+      setError(data.error || data.detail || 'No feasible route found under current strategic constraints.');
       setRecommendations([]);
-      onRouteGenerated(null);
+      if (typeof onRouteGenerated === 'function') onRouteGenerated(null);
       return;
     }
 
-    setRecommendations(data.recommendations);
+    setRecommendations(validRecs);
     setSelectedIdx(0);
-    onRouteGenerated(data.recommendations[0] || null, {
-      origin: searchQuery.source,
-      destination: searchQuery.dest,
-      scenario: scenarioId
-    });
+    if (typeof onRouteGenerated === 'function') {
+      onRouteGenerated(validRecs[0] || null, {
+        origin: searchQuery.source,
+        destination: searchQuery.dest,
+        scenario: scenarioId
+      });
+    }
 
     // Scenario impact: compare with the same request without the scenario.
     if (scenarioId) {
       const base = await requestRoutes(null);
-      if (base.ok && base.data.recommendations) {
-        setImpact(computeImpact(data.recommendations, base.data.recommendations));
+      if (base.ok && Array.isArray(base.data.recommendations)) {
+        const baseRecs = base.data.recommendations.filter(r => r && !r.error && Array.isArray(r.legs));
+        if (baseRecs.length > 0) {
+          setImpact(computeImpact(validRecs, baseRecs));
+        }
       }
     }
   } catch (err) {
     setError('Engine connection failed. Verify backend status.');
-    onRouteGenerated(null);
+    if (typeof onRouteGenerated === 'function') onRouteGenerated(null);
   } finally {
     setLoading(false);
   }
@@ -683,7 +697,7 @@ return (
               </span>
 
               <span style={{ color: '#10b981' }}>
-                ${rec.total_cost.toLocaleString()}
+                ${rec.total_cost != null ? rec.total_cost.toLocaleString() : '0'}
               </span>
             </div>
           </div>
@@ -700,7 +714,7 @@ return (
       <Layers size={14} /> Decision Integrity Audit
     </h2>
 
-    {recommendations.length > 0 && selected ? (
+    {recommendations.length > 0 && selected && selected.audit_trace ? (
 
       <div
         style={{
@@ -727,16 +741,16 @@ return (
           </div>
 
           <div>
-            Transit: {selected.audit_trace.eta.transit}h
+            Transit: {selected.audit_trace.eta?.transit != null ? `${selected.audit_trace.eta.transit}h` : 'N/A'}
           </div>
 
           <div>
-            Transfer: +{selected.audit_trace.eta.transfer}h
+            Transfer: +{selected.audit_trace.eta?.transfer != null ? `${selected.audit_trace.eta.transfer}h` : '0h'}
           </div>
 
           <div>
             Scenario Impact:{' '}
-            {selected.audit_trace.eta.scenario > 0
+            {selected.audit_trace.eta?.scenario > 0
               ? `+${selected.audit_trace.eta.scenario}h`
               : 'None'}
           </div>
@@ -760,19 +774,86 @@ return (
 
           <div>
             Landed Base: $
-            {selected.audit_trace.cost.transit.toLocaleString()}
+            {selected.audit_trace.cost?.transit != null ? selected.audit_trace.cost.transit.toLocaleString() : '0'}
           </div>
 
           <div>
             Transfer Fees: $
-            {selected.audit_trace.cost.transfer.toLocaleString()}
+            {selected.audit_trace.cost?.transfer != null ? selected.audit_trace.cost.transfer.toLocaleString() : '0'}
           </div>
 
           <div>
             Risk Premium: $
-            {selected.audit_trace.cost.scenario.toLocaleString()}
+            {selected.audit_trace.cost?.scenario != null ? selected.audit_trace.cost.scenario.toLocaleString() : '0'}
           </div>
         </div>
+
+        {/* SHAP Feature Attribution Card */}
+        {selected?.audit_trace?.shap_explanations && selected.audit_trace.shap_explanations.length > 0 && (
+          <div
+            className="audit-trace-box"
+            style={{
+              borderLeft: '4px solid #8b5cf6',
+              background: 'rgba(139, 92, 246, 0.05)'
+            }}
+          >
+            <div
+              style={{
+                marginBottom: '0.5rem',
+                fontWeight: 700,
+                color: '#c084fc',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between'
+              }}
+            >
+              <span>SHAP Feature Attribution</span>
+              <span style={{ fontSize: '0.65rem', color: '#a855f7', background: 'rgba(168, 85, 247, 0.15)', padding: '2px 6px', borderRadius: '4px', fontWeight: 800 }}>
+                TreeExplainer p85
+              </span>
+            </div>
+
+            {selected.audit_trace.shap_explanations.map((exp, expIdx) => (
+              <div key={expIdx} style={{ marginBottom: expIdx < selected.audit_trace.shap_explanations.length - 1 ? '0.75rem' : '0' }}>
+                <div style={{ fontSize: '0.75rem', fontWeight: 700, color: '#e2e8f0', marginBottom: '0.2rem' }}>
+                  Corridor: {exp.origin} → {exp.destination} ({exp.transport_mode?.toUpperCase()})
+                </div>
+
+                <div style={{ fontSize: '0.7rem', color: '#94a3b8', marginBottom: '0.4rem' }}>
+                  Base Expectation (E[f(x)]): {exp.base_value_hours}h
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+                  {exp.contributions?.slice(0, 5).map((contrib, cIdx) => {
+                    const isPositive = contrib.contribution_hours > 0;
+                    return (
+                      <div
+                        key={cIdx}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          fontSize: '0.7rem',
+                          background: 'rgba(15, 23, 42, 0.5)',
+                          padding: '4px 8px',
+                          borderRadius: '4px',
+                          border: '1px solid #1e293b'
+                        }}
+                      >
+                        <span style={{ color: '#cbd5e1' }}>
+                          {contrib.feature}: <strong style={{ color: '#f8fafc' }}>{String(contrib.value)}</strong>
+                        </span>
+                        <span style={{ fontWeight: 800, color: isPositive ? '#ef4444' : '#10b981' }}>
+                          {isPositive ? '+' : ''}{contrib.contribution_hours}h
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div
           className="audit-trace-box"

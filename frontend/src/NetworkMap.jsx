@@ -63,8 +63,11 @@ export default function NetworkMap({ hubs = [], route = null }) {
       const from = [fromHub.lat, fromHub.lon];
       const to = [toHub.lat, toHub.lon];
 
-      const mode = leg.mode.toLowerCase();
-      const alert = leg.intel_source === 'SCENARIO';
+      const rawMode = leg.mode || leg.transport_mode || 'road';
+      const mode = String(rawMode).toLowerCase();
+      const alert = leg.intel_source === 'SCENARIO' || leg.news_source === 'SCENARIO';
+      const etaVal = leg.eta ?? leg.time ?? 0;
+      const threatVal = leg.threat ?? leg.threat_level ?? 0;
 
       segments.push({
         from,
@@ -72,8 +75,8 @@ export default function NetworkMap({ hubs = [], route = null }) {
         mode,
         alert,
         label: `${fromHub.display_name} → ${toHub.display_name}`,
-        detail: `${leg.mode} • ${leg.eta}h • threat ${Math.round(leg.threat * 100)}%`,
-        reason: leg.reason
+        detail: `${rawMode} • ${etaVal}h • threat ${Math.round(threatVal * 100)}%`,
+        reason: leg.reason || leg.news || ''
       });
 
       stopMap[fromHub.id] = {
