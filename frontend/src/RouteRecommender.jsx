@@ -6,6 +6,23 @@ MapPin, Zap, Globe, ArrowRightLeft,
 BarChart3, Activity, Layers, Terminal
 } from 'lucide-react';
 
+// Compare each route with the same route type run without the scenario.
+const pathOf = (route) =>
+  route.legs.filter(l => l.type !== 'transfer').map(l => l.to).join('>');
+
+const computeImpact = (withScenario, baseline) =>
+  withScenario.map(scen => {
+    const base = baseline.find(r => r.persona === scen.persona);
+    if (!base) return null;
+    return {
+      persona: scen.persona,
+      deltaEta: Math.round((scen.adjusted_eta - base.adjusted_eta) * 10) / 10,
+      deltaCost: Math.round(scen.total_cost - base.total_cost),
+      pathChanged: pathOf(scen) !== pathOf(base),
+      hitLegs: scen.legs.filter(l => l.intel_source === 'SCENARIO').length
+    };
+  }).filter(Boolean);
+
 const RouteRecommender = ({
   onNavigate,
   onRouteGenerated,
@@ -31,7 +48,7 @@ source: [],
 dest: []
 });
 const [scenarios, setScenarios] = useState([]);
-const [hubs, setHubs] = useState([]);
+const [impact, setImpact] = useState(null);
 
 useEffect(() => {
 fetch('/api/scenarios')
@@ -39,55 +56,67 @@ fetch('/api/scenarios')
 .then(data => setScenarios(data))
 .catch(e => console.error('Failed to load scenarios', e));
 
-fetch('/api/hubs')
-  .then(r => r.json())
-  .then(data => setHubs(data))
-  .catch(e => console.error('Failed to load hubs', e));
+
 
 }, []);
 
 const getRecommendations = async () => {
-setLoading(true);
-setError(null);
+  setLoading(true);
+  setError(null);
+  setImpact(null);
 
-try {
-  const res = await fetch('/api/recommend', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      source,
-      destination,
-      transport_preference: transportMode,
-      routing_policy: routingPolicy,
-      cargo_type: cargoType,
-      priority: priority,
-      scenario:
-        operationalConfig !== 'NORMAL'
-          ? operationalConfig
-          : null
-    })
-  });
+  const scenarioId = operationalConfig !== 'NORMAL' ? operationalConfig : null;
 
-  const data = await res.json();
+  // Same request every time; only the scenario changes.
+  const requestRoutes = async (scenario) => {
+    const res = await fetch('/api/recommend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source,
+        destination,
+        transport_preference: transportMode,
+        routing_policy: routingPolicy,
+        cargo_type: cargoType,
+        priority: priority,
+        scenario
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, data };
+  };
 
-  if (data.error) {
-    setError(data.error);
-    setRecommendations([]);
-    onRouteGenerated(null);
-  } else {
+  try {
+    const { ok, data } = await requestRoutes(scenarioId);
+
+    if (!ok || data.error || !data.recommendations) {
+      setError(data.error || data.detail || 'Engine unavailable, try again shortly.');
+      setRecommendations([]);
+      onRouteGenerated(null);
+      return;
+    }
+
     setRecommendations(data.recommendations);
     setSelectedIdx(0);
-    onRouteGenerated(data.recommendations[0] || null);
-  }
-} catch (err) {
-  setError('Engine connection failed. Verify backend status.');
-  onRouteGenerated(null);
-} finally {
-  setLoading(false);
-}
+    onRouteGenerated(data.recommendations[0] || null, {
+      origin: searchQuery.source,
+      destination: searchQuery.dest,
+      scenario: scenarioId
+    });
 
+    // Scenario impact: compare with the same request without the scenario.
+    if (scenarioId) {
+      const base = await requestRoutes(null);
+      if (base.ok && base.data.recommendations) {
+        setImpact(computeImpact(data.recommendations, base.data.recommendations));
+      }
+    }
+  } catch (err) {
+    setError('Engine connection failed. Verify backend status.');
+    onRouteGenerated(null);
+  } finally {
+    setLoading(false);
+  }
 };
 
 const getModeIcon = (mode) => {
@@ -122,7 +151,7 @@ if (query.length < 2) {
 }
 
 try {
-  const res = await fetch(`/api/hubs/search?q=${query}`);
+  const res = await fetch(`/api/hubs/search?q=${encodeURIComponent(query)}`);
   const data = await res.json();
 
   setSearchResults(prev => ({
@@ -450,6 +479,28 @@ return (
         }}
       >
         {error}
+      </div>
+    )}
+
+    {impact && (
+      <div style={{ border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.08)', borderRadius: 8, padding: '0.9rem 1rem' }}>
+        <div style={{ fontWeight: 800, fontSize: '0.75rem', color: '#f59e0b' }}>
+          SCENARIO IMPACT 
+        </div>
+        {impact.map(row => (
+          <div key={row.persona} style={{ display: 'flex', gap: '1.5rem', marginTop: '0.4rem', fontSize: '0.9rem' }}>
+            <strong style={{ minWidth: 90 }}>{row.persona}</strong>
+            <span>ETA: {row.deltaEta >= 0 ? '+' : ''}{row.deltaEta}h</span>
+            <span>Cost: {row.deltaCost >= 0 ? '+' : '-'}${Math.abs(row.deltaCost).toLocaleString()}</span>
+            <span>Path: {row.pathChanged ? 'rerouted' : 'unchanged'}</span>
+            <span>Legs hit: {row.hitLegs}</span>
+          </div>
+        ))}
+        {impact.every(r => r.deltaEta === 0 && r.deltaCost === 0 && !r.pathChanged) && (
+          <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#94a3b8' }}>
+            This scenario had no measurable effect on these routes.
+          </div>
+        )}
       </div>
     )}
 
@@ -844,7 +895,7 @@ return (
             color: '#94a3b8'
           }}
         >
-          OPTIMAL SPEED:
+          SELECTED ETA:
         </span>
 
         <span

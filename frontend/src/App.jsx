@@ -23,11 +23,16 @@ export default function App() {
       .then(r => r.json())
       .then(data => setNetwork(data))
       .catch(e => console.error(e));
+      try {
       const savedHistory = localStorage.getItem('routeHistory');
-
       if (savedHistory) {
-          setRouteHistory(JSON.parse(savedHistory));
+        const parsed = JSON.parse(savedHistory);
+        if (Array.isArray(parsed)) setRouteHistory(parsed);
       }
+    } catch (e) {
+      // Corrupted saved history must never crash the app: start fresh instead.
+      localStorage.removeItem('routeHistory');
+    }
 
       
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -35,7 +40,6 @@ export default function App() {
     const ws = new WebSocket(wsUrl);
     ws.onmessage = (event) => {
       const state = JSON.parse(event.data);
-      console.log('WEBSOCKET UPDATE:', state);
       setStatus(state);
     };
     
@@ -163,7 +167,7 @@ export default function App() {
 
   URL.revokeObjectURL(url);
 };
-  const handleRouteGenerated = (route) => {
+  const handleRouteGenerated = (route,meta) => {
   setRouteForMap(route);
 
   if (!route) {
@@ -173,7 +177,8 @@ export default function App() {
   const historyItem = {
     id: Date.now(),
     timestamp: new Date().toLocaleString(),
-    route: route
+    route: route,
+    meta: meta || null
   };
 
   const updatedHistory = [
@@ -406,7 +411,7 @@ export default function App() {
   }}
 >
   <strong>
-    Route {routeHistory.length - index}
+    Route {routeHistory.length - index}{item.meta?.origin ? ` · ${item.meta.origin} → ${item.meta.destination}` : ''}
   </strong>
 
   <div
@@ -448,7 +453,7 @@ export default function App() {
                     >
 
                       <span>
-                        Strategy: {route?.persona || 'N/A'}
+                        Strategy: {route?.persona || 'N/A'}{item.meta?.scenario ? ` (scenario: ${item.meta.scenario})` : ''}
                       </span>
 
                       <span>
