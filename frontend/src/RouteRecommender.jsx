@@ -1,402 +1,990 @@
-import networkx as nx
-import math
-import time
-from typing import List, Dict, Any, Optional
-from .multimodal_network import MODE_PROFILES, create_multimodal_network
-from .threat_intelligence import ThreatIntelligencePredictor, ContrastiveNLPEngine, CARFFilter
-from .news_ingestion import DynamicNewsIngestor
-from .node_resolver import NodeResolver
+import React, { useState, useEffect } from 'react';
+import {
+Truck, Ship, Plane, Train,
+AlertTriangle, ShieldCheck, Clock, Navigation,
+MapPin, Zap, Globe, ArrowRightLeft,
+BarChart3, Activity, Layers, Terminal
+} from 'lucide-react';
 
-PERSONAS = ["FASTEST", "SAFEST", "BALANCED"]
+// Compare each route with the same route type run without the scenario.
+const pathOf = (route) =>
+  route.legs.filter(l => l.type !== 'transfer').map(l => l.to).join('>');
+
+const computeImpact = (withScenario, baseline) =>
+  withScenario.map(scen => {
+    const base = baseline.find(r => r.persona === scen.persona);
+    if (!base) return null;
+    return {
+      persona: scen.persona,
+      deltaEta: Math.round((scen.adjusted_eta - base.adjusted_eta) * 10) / 10,
+      deltaCost: Math.round(scen.total_cost - base.total_cost),
+      pathChanged: pathOf(scen) !== pathOf(base),
+      hitLegs: scen.legs.filter(l => l.intel_source === 'SCENARIO').length
+    };
+  }).filter(Boolean);
+
+const RouteRecommender = ({
+  onNavigate,
+  onRouteGenerated,
+  onRouteSelected
+}) => {
+const [source, setSource] = useState('');
+const [destination, setDestination] = useState('');
+const [transportMode, setTransportMode] = useState('any');
+const [routingPolicy, setRoutingPolicy] = useState('STRICT');
+const [operationalConfig, setOperationalConfig] = useState('NORMAL');
+const [cargoType, setCargoType] = useState('general');
+const [priority, setPriority] = useState('normal');
+const [recommendations, setRecommendations] = useState([]);
+const [selectedIdx, setSelectedIdx] = useState(0);
+const [loading, setLoading] = useState(false);
+const [error, setError] = useState(null);
+const [searchQuery, setSearchQuery] = useState({
+source: '',
+dest: ''
+});
+const [searchResults, setSearchResults] = useState({
+source: [],
+dest: []
+});
+const [scenarios, setScenarios] = useState([]);
+const [impact, setImpact] = useState(null);
+
+useEffect(() => {
+fetch('/api/scenarios')
+.then(r => r.json())
+.then(data => setScenarios(data))
+.catch(e => console.error('Failed to load scenarios', e));
 
 
-class RouteRecommender:
-    """
-    Supplychainer Unified Multimodal Optimization Engine.
-    V8: Virtual-Node Forensic Edition.
 
-    Patched: live news -> NLP -> CARF now drives threat on the corridor being
-    routed, and the p85 quantile model adds a worst-case delay buffer to the
-    SAFEST and BALANCED weights. Both are computed lazily for candidate-path
-    edges only (not the whole graph) and iterated until the candidate set is stable.
-    """
+}, []);
 
-    def __init__(self, network, predictor, simulator, scenario_mgr, demo_mode=False):
-        self.network = network # Legacy
-        self.predictor = predictor
-        self.simulator = simulator
-        self.scenario_mgr = scenario_mgr
-        self.demo_mode = demo_mode
-        self.is_warmed_up = False
-        self.warmup_failed = False
+const getRecommendations = async () => {
+  setLoading(true);
+  setError(null);
+  setImpact(null);
 
-        self.nlp = ContrastiveNLPEngine(lazy_load=True)
-        self.carf = CARFFilter()
-        self.news_ingestor = DynamicNewsIngestor()
-        self.resolver = NodeResolver()
+  const scenarioId = operationalConfig !== 'NORMAL' ? operationalConfig : null;
 
-        self._score_cache = {}   # (news_text, mode) -> CARF-filtered threat
-        self._ml_cache = {}      # (origin, dest, mode, nlp_bucket) -> p85 hours or None
+  // Same request every time; only the scenario changes.
+  const requestRoutes = async (scenario) => {
+    const res = await fetch('/api/recommend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source,
+        destination,
+        transport_preference: transportMode,
+        routing_policy: routingPolicy,
+        cargo_type: cargoType,
+        priority: priority,
+        scenario
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, data };
+  };
 
-        print(f"[STARTUP] Initializing Split-Node Global Topology...")
-        self.unified_graph = create_multimodal_network()
+  try {
+    const { ok, data } = await requestRoutes(scenarioId);
 
+    if (!ok || data.error || !data.recommendations) {
+      setError(data.error || data.detail || 'Engine unavailable, try again shortly.');
+      setRecommendations([]);
+      onRouteGenerated(null);
+      return;
+    }
 
-        if self.demo_mode:
-            print("[DEMO MODE] Running synchronous warmup...")
-            self.run_background_warmup()
+    setRecommendations(data.recommendations);
+    setSelectedIdx(0);
+    onRouteGenerated(data.recommendations[0] || null, {
+      origin: searchQuery.source,
+      destination: searchQuery.dest,
+      scenario: scenarioId
+    });
 
-        print(f"[STARTUP] Unified Engine Ready.")
+    // Scenario impact: compare with the same request without the scenario.
+    if (scenarioId) {
+      const base = await requestRoutes(null);
+      if (base.ok && base.data.recommendations) {
+        setImpact(computeImpact(data.recommendations, base.data.recommendations));
+      }
+    }
+  } catch (err) {
+    setError('Engine connection failed. Verify backend status.');
+    onRouteGenerated(null);
+  } finally {
+    setLoading(false);
+  }
+};
 
-    def run_background_warmup(self):
-        if self.is_warmed_up: return
-        print("[WARMUP] Calibrating global threat floor...")
-        try:
-            self.predictor.warmup()
-            self.nlp.warmup()
+const getModeIcon = (mode) => {
+switch (mode.toLowerCase()) {
+case 'air':
+return <Plane size={12} />;
+case 'sea':
+return <Ship size={12} />;
+case 'rail':
+return <Train size={12} />;
+case 'road':
+return <Truck size={12} />;
+case 'transfer':
+return <ArrowRightLeft size={12} />;
+default:
+return <Navigation size={12} />;
+}
+};
 
-            # Offline baseline intelligence (used when live news is unavailable)
-            for u, v, d in self.unified_graph.edges(data=True):
-                mode = d.get("transport_mode", "road")
-                if mode == "transfer": continue
-                news = self.news_ingestor.fallback_news.get(mode, "Normal conditions.")
-                score = self.nlp.get_semantic_score(news)
-                threat = self.carf.apply_filter(score, news, mode)
-                self.unified_graph[u][v]["base_threat"] = threat
-                self.unified_graph[u][v]["base_news"] = news
+const handleSearch = async (type, query) => {
+setSearchQuery(prev => ({
+...prev,
+[type]: query
+}));
 
-            self.is_warmed_up = True
-            print("[WARMUP] Unified Calibration Complete.")
-        except Exception as e:
-            print(f"[WARMUP] Error during warmup: {e}")
-            self.warmup_failed = True
+if (query.length < 2) {
+  setSearchResults(prev => ({
+    ...prev,
+    [type]: []
+  }));
+  return;
+}
 
-    # ------------------------------------------------------------------
-    # Live intelligence + ML buffer (computed only for edges we actually consider)
-    # ------------------------------------------------------------------
-    def _live_intel(self, G, pairs):
-        """pairs: [(physical_id, mode)] -> {(physical_id, mode): {threat, news, source}}"""
-        keyed = []
-        for pid, mode in pairs:
-            node = f"{pid}:{mode}"
-            name = G.nodes[node].get("display_name", pid) if node in G else pid
-            keyed.append(((pid, mode), (name, mode)))
+try {
+  const res = await fetch(`/api/hubs/search?q=${encodeURIComponent(query)}`);
+  const data = await res.json();
 
-        fetched = self.news_ingestor.prefetch([k for _, k in keyed])
-        out = {}
-        for pair, k in keyed:
-            text, source = fetched[k]
-            ck = (text, pair[1])
-            if ck not in self._score_cache:
-                score = self.nlp.get_semantic_score(text)          # 0.0 if NLP not ready
-                self._score_cache[ck] = self.carf.apply_filter(score, text, pair[1])
-            out[pair] = {"threat": self._score_cache[ck], "news": text, "source": source}
-        return out
+  setSearchResults(prev => ({
+    ...prev,
+    [type]: data
+  }));
+} catch (err) {
+  console.error('Search failed');
+}
 
-    def _ml_buffer(self, G, u, v, nlp_score):
-        """p85 worst-case delay (hours) for one transit edge, or None if the model
-        isn't loaded or doesn't cover this lane."""
-        if not getattr(self.predictor, "is_trained", False):
-            return None
-        d = G[u][v]
-        key = (G.nodes[u].get("display_name"), G.nodes[v].get("display_name"),
-               d["transport_mode"], round(nlp_score, 1))
-        if key not in self._ml_cache:
-            try:
-                r = self.predictor.predict_worst_case_delay(key[0], key[1], key[2], nlp_score=nlp_score)
-                self._ml_cache[key] = float(r["final_delay_presented"]) if r.get("covered", True) else None
-            except Exception as e:
-                print(f"[ML] p85 lookup failed for {key}: {e}")
-                self._ml_cache[key] = None
-        return self._ml_cache[key]
+};
 
-    def _enrich(self, G, edges, disruptions, intel, buffers):
-        transit = [(u, v) for u, v in edges if G[u][v]["type"] != "transfer"]
-        pairs = {(G.nodes[v].get("physical_id"), G[u][v]["transport_mode"]) for u, v in transit}
-        pairs = [p for p in pairs if p not in intel]
-        if pairs:
-            intel.update(self._live_intel(G, pairs))
-        for u, v in transit:
-            d = G[u][v]
-            pid = G.nodes[v].get("physical_id")
-            # Scenario delay already dominates a disrupted hub; don't stack the model on top.
-            if pid in disruptions:
-                buffers[(u, v)] = None
-                continue
-            threat = self._edge_threat(d, pid, d["transport_mode"], intel)
-            buffers[(u, v)] = self._ml_buffer(G, u, v, threat)
+const selectHub = (type, hub) => {
+if (type === 'source') {
+setSource(hub.id);
+setSearchQuery(prev => ({
+...prev,
+source: hub.display_name
+}));
+} else {
+setDestination(hub.id);
+setSearchQuery(prev => ({
+...prev,
+dest: hub.display_name
+}));
+}
 
-    @staticmethod
-    def _edge_threat(d, p_id, mode, intel):
-        live = intel.get((p_id, mode))
-        if live and live["source"] == "LIVE":
-            return live["threat"]
-        return d.get("base_threat", 0.05)
+setSearchResults(prev => ({
+  ...prev,
+  [type]: []
+}));
 
-    # ------------------------------------------------------------------
-    def recommend(self, source: str, destination: str, transport_preference: str = "any",
-                  routing_policy: str = "STRICT", cargo_type: str = "general",
-                  priority: str = "normal", scenario: str = None,
-                  overrides: dict = None) -> dict:
-        t0 = time.perf_counter()
-        overrides = overrides or {}
-        avoid_hubs = overrides.get("avoid_chokepoints", [])
-        cost_ceiling = overrides.get("cost_ceiling", 999999)
-        max_delay = overrides.get("max_delay", 9999)
+};
 
-        # 1. Resolve Entry/Exit (Virtual Nodes)
-        res_s = self.resolver.resolve_node_to_entry_point(source)
-        res_d = self.resolver.resolve_node_to_entry_point(destination)
+const selected =
+recommendations[selectedIdx] || recommendations[0];
 
-        if "error" in res_s: return {"error": res_s["error"]}
-        if "error" in res_d: return {"error": res_d["error"]}
+return (
+<div className="dashboard-layout">
 
-        s_vnode, d_vnode = res_s["id"], res_d["id"]
+  <header className="dashboard-header">
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '1rem'
+      }}
+    >
+      <Globe size={28} color="#3b82f6" />
 
-        # 2. Scenario Activation
-        active_scenario = self.scenario_mgr.activate_scenario(scenario)
-        disruptions = self.scenario_mgr.get_active_disruptions()
+      <div>
+        <h1
+          style={{
+            fontSize: '1.25rem',
+            fontWeight: 800
+          }}
+        >
+          Supplychainer Command Console
+        </h1>
 
-        G_base = self.unified_graph.copy()
-        for hub_id in avoid_hubs:
-            G_base.remove_nodes_from([n for n, d in G_base.nodes(data=True)
-                                      if d.get("physical_id") == hub_id])
-        refs = {
-            "air":     self._reference_route(G_base, s_vnode, d_vnode, ["air", "transfer", "road"], disruptions),
-            "surface": self._reference_route(G_base, s_vnode, d_vnode, ["sea", "rail", "road", "transfer"], disruptions),
+        <p
+          style={{
+            fontSize: '0.7rem',
+            color: '#64748b',
+            fontWeight: 700
+          }}
+        >
+          UNIFIED MULTIMODAL DECISION SUPERIORITY ENGINE
+        </p>
+      </div>
+    </div>
+
+    <div
+      style={{
+        display: 'flex',
+        gap: '1rem'
+      }}
+    >
+      <button
+        className="sc-badge-active"
+        onClick={() => onNavigate('network')}
+        style={{ cursor: 'pointer' }}
+      >
+        <MapPin size={14} /> NETWORK MAP
+      </button>
+
+      <button
+        className="sc-badge-active"
+        onClick={() => onNavigate('suppliers')}
+        style={{ cursor: 'pointer' }}
+      >
+        <ShieldCheck size={14} /> SUPPLIER INTELLIGENCE
+      </button>
+    </div>
+  </header>
+
+  <aside className="sidebar-left">
+    <h2 className="panel-title">
+      <Terminal size={14} /> Strategic Input Panel
+    </h2>
+
+    <div className="sc-input-group">
+      <label className="sc-label">Origin Hub</label>
+
+      <input
+        type="text"
+        value={searchQuery.source}
+        onChange={(e) =>
+          handleSearch('source', e.target.value)
         }
+        className="sc-input"
+        placeholder="Search origin..."
+      />
 
-        # Persona graph: the STRICT filter is identical for every persona, so build it once.
-        G_p = G_base
-        if transport_preference != "any" and routing_policy == "STRICT":
-            allowed_modes = [transport_preference, "transfer", "road"]
-            G_p.remove_edges_from([(u, v) for u, v, d in G_p.edges(data=True)
-                                   if d["transport_mode"] not in allowed_modes])
+      {searchResults.source.length > 0 && (
+        <div
+          style={{
+            background: '#0f172a',
+            border: '1px solid #1e293b',
+            borderRadius: '4px',
+            marginTop: '2px'
+          }}
+        >
+          {searchResults.source.map((h, idx) => (
+            <button
+              key={`${h.id}-${idx}`}
+              onClick={() => selectHub('source', h)}
+              style={{
+                width: '100%',
+                padding: '8px',
+                textAlign: 'left',
+                background: 'none',
+                border: 'none',
+                color: 'white',
+                borderBottom: '1px solid #1e293b',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              {h.display_name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
 
-        intel: Dict[Any, Any] = {}      # (physical_id, mode) -> live intel
-        buffers: Dict[Any, Any] = {}    # (u, v) -> p85 buffer hours (None = not covered)
+    <div className="sc-input-group">
+      <label className="sc-label">Destination Hub</label>
 
-        def make_weight(persona):
-            def weight_func(u, v, d):
-                mode = d["transport_mode"]
-                base_t = d["baseline_time"]
-                base_c = d.get("cost", 0)
-                p_id = G_p.nodes[v].get("physical_id")
-
-                threat = self._edge_threat(d, p_id, mode, intel)
-                delay = 0
-                if p_id in disruptions:
-                    threat = max(threat, disruptions[p_id]["threat"])
-                    delay += disruptions[p_id]["delay"]
-                buf = buffers.get((u, v)) or 0.0
-
-                if persona == "FASTEST":
-                    return base_t + delay
-                elif persona == "SAFEST":
-                    return (base_t + delay + buf) * (1.0 + threat * 12.0)
-                else:  # BALANCED
-                    return ((base_t + delay + buf) * 0.3
-                            + (base_c / 150.0) * 0.5
-                            + (threat * 40.0) * 0.2)
-            return weight_func
-
-        # 3a. Discovery: route with what we know, fetch intel for the edges those routes use,
-        #     re-route, repeat until no new edges show up (max 3 rounds).
-        seen_edges = set()
-        for _ in range(3):
-            edges = set()
-            for persona in PERSONAS:
-                try:
-                    p = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=make_weight(persona))
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    continue
-                edges.update(zip(p, p[1:]))
-            fresh = edges - seen_edges
-            if not fresh:
-                break
-            self._enrich(G_p, fresh, disruptions, intel, buffers)
-            seen_edges |= fresh
-
-        # 3b. Final persona optimization
-        candidates = []
-        for persona in PERSONAS:
-            try:
-                path = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=make_weight(persona))
-
-                legs = []
-                total_time, total_cost, max_threat, total_buffer = 0, 0, 0, 0.0
-                trace = {
-                    "eta": {"transit": 0, "transfer": 0, "scenario": 0, "p85_buffer": 0},
-                    "cost": {"transit": 0, "transfer": 0, "scenario": 0},
-                    "risk": {"baseline": 0, "scenario": 0}
-                }
-
-                for i in range(len(path)-1):
-                    u, v = path[i], path[i+1]
-                    d = G_p[u][v]
-                    mode = d["transport_mode"]
-                    v_data = G_p.nodes[v]
-                    p_id = v_data.get("physical_id")
-
-                    l_time = d["baseline_time"]
-                    l_cost = d.get("cost", 0)
-                    l_delay = 0.0
-                    l_premium = 0.0
-                    l_threat = d.get("base_threat", 0.05)
-                    l_news = d.get("base_news", "Standard conditions")
-                    l_source = "FALLBACK"
-
-                    live = intel.get((p_id, mode))
-                    if live and live["source"] == "LIVE":
-                        l_threat = live["threat"]
-                        l_news = live["news"]
-                        l_source = "LIVE"
-
-                    if p_id in disruptions:
-                        l_delay = disruptions[p_id]["delay"]
-                        l_premium = l_cost * 0.1
-                        l_threat = max(l_threat, disruptions[p_id]["threat"])
-                        l_news = disruptions[p_id]["reason"]
-                        l_source = "SCENARIO"
-                        trace["eta"]["scenario"] += l_delay
-                        trace["cost"]["scenario"] += l_premium
-                        trace["risk"]["scenario"] = max(trace["risk"]["scenario"], l_threat)
-
-                    l_buffer = buffers.get((u, v))
-
-                    if d["type"] == "transfer":
-                        trace["eta"]["transfer"] += l_time
-                        trace["cost"]["transfer"] += l_cost
-                    else:
-                        trace["eta"]["transit"] += l_time
-                        trace["cost"]["transit"] += l_cost
-                        trace["risk"]["baseline"] = max(trace["risk"]["baseline"], l_threat)
-
-                    if l_buffer:
-                        trace["eta"]["p85_buffer"] += l_buffer
-                        total_buffer += l_buffer
-
-                    total_time += l_time + l_delay
-                    total_cost += l_cost + l_premium
-                    max_threat = max(max_threat, l_threat)
-
-                    legs.append({
-                        "from": G_p.nodes[u].get("physical_id", u),
-                        "to": p_id,
-                        "to_name": v_data.get("display_name", p_id),
-                        "mode": mode.upper(),
-                        "type": d["type"],
-                        "eta": round(l_time + l_delay, 1),
-                        "eta_transit": round(l_time, 1),
-                        "eta_delay": round(l_delay, 1),
-                        "cost": round(l_cost + l_premium, 2),
-                        "cost_base": round(l_cost, 2),
-                        "cost_premium": round(l_premium, 2),
-                        "p85_buffer": round(l_buffer, 1) if l_buffer is not None else None,
-                        "threat": round(l_threat, 2),
-                        "reason": l_news,
-                        "intel_source": l_source
-                    })
-
-                if total_cost > cost_ceiling or total_time > (max_delay * 24): continue
-
-                candidates.append({
-                    "persona": persona,
-                    "primary_mode": "MULTIMODAL",
-                    "legs": legs,
-                    "adjusted_eta": round(total_time, 1),
-                    "p85_eta": round(total_time + total_buffer, 1),
-                    "total_cost": round(total_cost, 2),
-                    "threat_level": round(max_threat, 2),
-                    "audit_trace": trace,
-                    "override_applied": bool(avoid_hubs or cost_ceiling < 999999)
-                })
-
-            except nx.NetworkXNoPath:
-                continue
-            except Exception as e:
-                print(f"[ROUTING ERROR] {persona}: {e}")
-
-        if not candidates:
-            return {"error": "No valid multimodal route established under current strategic constraints."}
-
-        # Deduplicate and sort
-        final = []
-        seen = set()
-        for c in sorted(candidates, key=lambda x: x["adjusted_eta"]):
-            path_sig = tuple((l["mode"], l["to"]) for l in c["legs"])
-            if path_sig not in seen:
-                final.append(c)
-                seen.add(path_sig)
-        peer_threats = [c["threat_level"] for c in final]
-        for c in final:
-            c["explanation"] = self._generate_forensic_explanation(
-                c["persona"], c["audit_trace"], c["threat_level"], c["legs"], refs, peer_threats)
-        return {
-            "origin": source, "destination": destination,
-            "active_scenario": active_scenario["name"] if active_scenario else None,
-            "recommendations": final[:3]
+      <input
+        type="text"
+        value={searchQuery.dest}
+        onChange={(e) =>
+          handleSearch('dest', e.target.value)
         }
+        className="sc-input"
+        placeholder="Search destination..."
+      />
 
-    def _reference_route(self, G, s_vnode, d_vnode, allowed_modes, disruptions):
-        """Single-mode baseline (pure AIR / pure surface) for explanations. None if no route."""
-        G_ref = G.copy()
-        G_ref.remove_edges_from([(u, v) for u, v, d in G_ref.edges(data=True)
-                                 if d["transport_mode"] not in allowed_modes])
-        try:
-            path = nx.dijkstra_path(G_ref, s_vnode, d_vnode, weight="baseline_time")
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            return None
+      {searchResults.dest.length > 0 && (
+        <div
+          style={{
+            background: '#0f172a',
+            border: '1px solid #1e293b',
+            borderRadius: '4px',
+            marginTop: '2px'
+          }}
+        >
+          {searchResults.dest.map((h, idx) => (
+            <button
+              key={`${h.id}-${idx}`}
+              onClick={() => selectHub('dest', h)}
+              style={{
+                width: '100%',
+                padding: '8px',
+                textAlign: 'left',
+                background: 'none',
+                border: 'none',
+                color: 'white',
+                borderBottom: '1px solid #1e293b',
+                cursor: 'pointer',
+                fontSize: '0.8rem'
+              }}
+            >
+              {h.display_name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
 
-        eta = cost = 0.0
-        for u, v in zip(path, path[1:]):
-            d = G_ref[u][v]
-            leg_t, leg_c = d["baseline_time"], d.get("cost", 0.0)
-            hit = disruptions.get(G_ref.nodes[v].get("physical_id"))
-            if hit:
-                leg_t += hit["delay"]
-                leg_c += leg_c * 0.1
-            eta += leg_t
-            cost += leg_c
-        return {"eta": round(eta, 1), "cost": round(cost, 2)}
+    <div className="sc-input-group">
+      <label className="sc-label">Transport Mode</label>
 
-    def _generate_forensic_explanation(self, persona, trace, threat, legs, refs, peer_threats):
-        eta = trace["eta"]["transit"] + trace["eta"]["transfer"] + trace["eta"]["scenario"]
-        cost = trace["cost"]["transit"] + trace["cost"]["transfer"] + trace["cost"]["scenario"]
-        transfer_count = sum(1 for l in legs if l["type"] == "transfer")
+      <select
+        value={transportMode}
+        onChange={e => setTransportMode(e.target.value)}
+        className="sc-select"
+      >
+        <option value="any">Unconstrained</option>
+        <option value="sea">SEA (Maritime Corridors)</option>
+        <option value="air">AIR (Express Cargo)</option>
+        <option value="rail">RAIL (Inland Freight)</option>
+        <option value="road">ROAD (Local Distribution)</option>
+      </select>
+    </div>
 
-        if persona == "FASTEST":
-            ref = refs["surface"]
-            if ref and ref["eta"] > eta:
-                claim = f"Arrives {round(ref['eta'] - eta, 1)}h sooner than the fastest surface-only alternative."
-            elif ref:
-                claim = f"Matches the surface-only alternative within {round(abs(ref['eta'] - eta), 1)}h."
-            else:
-                claim = "No surface-only alternative exists for this lane."
-            return (f"Velocity-optimized. {claim} {transfer_count} strategic transfer(s) "
-                    f"totalling {round(trace['eta']['transfer'], 1)}h.")
+    <div className="sc-input-group">
+      <label className="sc-label">Routing Policy</label>
 
-        if persona == "SAFEST":
-            worse = [t for t in peer_threats if t > threat]
-            if worse:
-                peak = max(worse)
-                claim = (f"Holds threat exposure {round((peak - threat) / peak * 100)}% below the "
-                         f"{round(peak * 100)}% ceiling of the alternatives evaluated.")
-            else:
-                claim = (f"Ties the lowest threat exposure of the alternatives evaluated "
-                         f"at {round(threat * 100)}%.")
-            return f"Resilience-optimized. {claim} Lead-time integrity prioritized over cost."
+      <select
+        value={routingPolicy}
+        onChange={e => setRoutingPolicy(e.target.value)}
+        className="sc-select"
+      >
+        <option value="STRICT">
+          STRICT (Hard Exclusion)
+        </option>
+        <option value="PREFERRED">
+          PREFERRED (Soft Bias)
+        </option>
+      </select>
+    </div>
 
-        ref = refs["air"]
-        if ref and ref["cost"] > 0:
-            delta = (ref["cost"] - cost) / ref["cost"] * 100
-            claim = (f"Lands {round(delta)}% below the air-only alternative (${round(ref['cost'] - cost)} saved)."
-                     if delta >= 0 else
-                     f"Priced {round(-delta)}% above the air-only alternative (${round(cost - ref['cost'])} premium).")
-        elif ref:
-            claim = "Air-only alternative priced at zero; no cost basis to compare."
-        else:
-            claim = "No air-only alternative exists for this lane."
-        scen = (f" Scenario adds ${round(trace['cost']['scenario'])} and {round(trace['eta']['scenario'])}h."
-                if trace["cost"]["scenario"] or trace["eta"]["scenario"] else "")
-        return f"Economic-optimized. {claim} Lead time {round(eta, 1)}h at ${round(cost)} landed.{scen}"
+    <div className="sc-input-group">
+      <label className="sc-label">
+        Operational Configuration
+      </label>
+
+      <select
+        value={operationalConfig}
+        onChange={e =>
+          setOperationalConfig(e.target.value)
+        }
+        className="sc-select"
+        style={{
+          borderColor:
+            operationalConfig !== 'NORMAL'
+              ? '#ef4444'
+              : '#1e293b'
+        }}
+      >
+        <option value="NORMAL">
+          Operational Normal
+        </option>
+
+        {scenarios.map(s => (
+          <option key={s.id} value={s.id}>
+            {s.name}
+          </option>
+        ))}
+      </select>
+    </div>
+
+    <div className="sc-input-group">
+      <label className="sc-label">
+        Strategic Overrides
+      </label>
+
+      <div
+        style={{
+          background: 'rgba(59, 130, 246, 0.05)',
+          padding: '0.75rem',
+          borderRadius: '8px',
+          border: '1px solid #1e293b',
+          fontSize: '0.75rem',
+          color: '#64748b'
+        }}
+      >
+        Auto-bypass enabled for verified chokepoints.
+      </div>
+    </div>
+
+    <button
+      className="sc-btn-execute"
+      onClick={getRecommendations}
+      disabled={loading}
+    >
+      {loading ? (
+        <Zap className="animate-pulse" size={16} />
+      ) : (
+        'GENERATE STRATEGIC ROUTE OPTIONS'
+      )}
+    </button>
+  </aside>
+
+  <main className="main-content">
+
+    {operationalConfig !== 'NORMAL' && (
+      <div className="scenario-banner animate-slide-in">
+        <AlertTriangle size={20} />
+
+        <div>
+          <span
+            style={{
+              fontWeight: 800,
+              fontSize: '0.75rem',
+              display: 'block'
+            }}
+          >
+            ACTIVE GLOBAL DISRUPTION DETECTED
+          </span>
+
+          <span style={{ fontSize: '0.875rem' }}>
+            {
+              scenarios.find(
+                s => s.id === operationalConfig
+              )?.name
+              || operationalConfig
+            }
+            {' '}logic active in unified solver.
+          </span>
+        </div>
+      </div>
+    )}
+
+    {error && (
+      <div
+        style={{
+          color: '#ef4444',
+          background: 'rgba(239, 68, 68, 0.1)',
+          padding: '1rem',
+          borderRadius: '8px',
+          border: '1px solid #ef4444'
+        }}
+      >
+        {error}
+      </div>
+    )}
+
+    {impact && (
+      <div style={{ border: '1px solid #f59e0b', background: 'rgba(245,158,11,0.08)', borderRadius: 8, padding: '0.9rem 1rem' }}>
+        <div style={{ fontWeight: 800, fontSize: '0.75rem', color: '#f59e0b' }}>
+          SCENARIO IMPACT 
+        </div>
+        {impact.map(row => (
+          <div key={row.persona} style={{ display: 'flex', gap: '1.5rem', marginTop: '0.4rem', fontSize: '0.9rem' }}>
+            <strong style={{ minWidth: 90 }}>{row.persona}</strong>
+            <span>ETA: {row.deltaEta >= 0 ? '+' : ''}{row.deltaEta}h</span>
+            <span>Cost: {row.deltaCost >= 0 ? '+' : '-'}${Math.abs(row.deltaCost).toLocaleString()}</span>
+            <span>Path: {row.pathChanged ? 'rerouted' : 'unchanged'}</span>
+            <span>Legs hit: {row.hitLegs}</span>
+          </div>
+        ))}
+        {impact.every(r => r.deltaEta === 0 && r.deltaCost === 0 && !r.pathChanged) && (
+          <div style={{ marginTop: '0.4rem', fontSize: '0.8rem', color: '#94a3b8' }}>
+            This scenario had no measurable effect on these routes.
+          </div>
+        )}
+      </div>
+    )}
+
+    <div className="path-grid">
+
+      {recommendations.map((rec, idx) => (
+        <div
+          key={idx}
+          className="path-card"
+          onClick={() => {
+            setSelectedIdx(idx);
+            onRouteSelected(rec);
+          }}
+          style={{
+            cursor: 'pointer',
+            outline:
+              idx === selectedIdx
+                ? '2px solid #3b82f6'
+                : 'none'
+          }}
+        >
+
+          <div className="card-header">
+
+            <span
+              className={`persona-badge ${
+                rec.persona === 'FASTEST'
+                  ? 'tag-fastest'
+                  : rec.persona === 'SAFEST'
+                  ? 'tag-safest'
+                  : 'tag-balanced'
+              }`}
+            >
+              {rec.persona}
+            </span>
+
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+                fontSize: '0.75rem',
+                fontFamily: 'JetBrains Mono'
+              }}
+            >
+              <Clock size={12} />
+              {rec.adjusted_eta}h
+            </div>
+
+          </div>
+
+          <div style={{ padding: '1.25rem' }}>
+
+            <h3
+              style={{
+                fontSize: '0.9rem',
+                fontWeight: 700,
+                marginBottom: '1.5rem'
+              }}
+            >
+              {rec.explanation}
+            </h3>
+
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.75rem',
+                borderLeft: '2px solid #1e293b',
+                paddingLeft: '1rem',
+                marginLeft: '0.5rem'
+              }}
+            >
+
+              {rec.legs.map((leg, lIdx) => {
+
+                const isTransfer =
+                  leg.type === 'transfer';
+
+                return (
+                  <div
+                    key={lIdx}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      opacity:
+                        isTransfer ? 0.7 : 1
+                    }}
+                  >
+
+                    <span
+                      style={{
+                        fontSize: '0.65rem',
+                        fontWeight: 800,
+                        color:
+                          isTransfer
+                            ? '#94a3b8'
+                            : '#3b82f6',
+                        letterSpacing: '0.05em',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '4px'
+                      }}
+                    >
+                      {getModeIcon(leg.mode)}
+
+                      {isTransfer
+                        ? 'STRATEGIC HANDOFF'
+                        : `${leg.mode} TRANSIT`}
+                    </span>
+
+                    <span
+                      style={{
+                        fontSize: '0.8rem',
+                        fontWeight: 600
+                      }}
+                    >
+                      {isTransfer
+                        ? `Processing at ${leg.to_name}`
+                        : `to ${leg.to_name}`}
+                    </span>
+
+                    {!isTransfer && (
+                      <span
+                        style={{
+                          fontSize: '0.7rem',
+                          color:
+                            leg.threat >= 0.5
+                              ? '#ef4444'
+                              : '#64748b'
+                        }}
+                      >
+                        {leg.eta}h • threat{' '}
+                        {Math.round(leg.threat * 100)}%
+                      </span>
+                    )}
+
+                    {leg.intel_source === 'SCENARIO' && (
+                      <span
+                        style={{
+                          fontSize: '0.7rem',
+                          color: '#fca5a5',
+                          background:
+                            'rgba(239,68,68,0.1)',
+                          border:
+                            '1px solid #ef4444',
+                          borderRadius: 4,
+                          padding: '4px 6px',
+                          marginTop: 4
+                        }}
+                      >
+                        {leg.reason}
+                      </span>
+                    )}
+
+                  </div>
+                );
+              })}
+
+            </div>
+          </div>
+
+          <div
+            style={{
+              padding: '1.25rem',
+              borderTop: '1px solid #1e293b',
+              background: 'rgba(15, 23, 42, 0.3)'
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                fontSize: '0.8rem',
+                fontWeight: 700
+              }}
+            >
+              <span style={{ color: '#64748b' }}>
+                TOTAL COST
+              </span>
+
+              <span style={{ color: '#10b981' }}>
+                ${rec.total_cost.toLocaleString()}
+              </span>
+            </div>
+          </div>
+
+        </div>
+      ))}
+
+    </div>
+  </main>
+
+  <aside className="sidebar-right">
+
+    <h2 className="panel-title">
+      <Layers size={14} /> Decision Integrity Audit
+    </h2>
+
+    {recommendations.length > 0 && selected ? (
+
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '1rem'
+        }}
+      >
+
+        <div
+          className="audit-trace-box"
+          style={{
+            borderLeft: '4px solid #3b82f6'
+          }}
+        >
+          <div
+            style={{
+              marginBottom: '0.5rem',
+              fontWeight: 700,
+              color: '#f8fafc'
+            }}
+          >
+            Forensic ETA Audit
+          </div>
+
+          <div>
+            Transit: {selected.audit_trace.eta.transit}h
+          </div>
+
+          <div>
+            Transfer: +{selected.audit_trace.eta.transfer}h
+          </div>
+
+          <div>
+            Scenario Impact:{' '}
+            {selected.audit_trace.eta.scenario > 0
+              ? `+${selected.audit_trace.eta.scenario}h`
+              : 'None'}
+          </div>
+        </div>
+
+        <div
+          className="audit-trace-box"
+          style={{
+            borderLeft: '4px solid #10b981'
+          }}
+        >
+          <div
+            style={{
+              marginBottom: '0.5rem',
+              fontWeight: 700,
+              color: '#f8fafc'
+            }}
+          >
+            Cost Composition
+          </div>
+
+          <div>
+            Landed Base: $
+            {selected.audit_trace.cost.transit.toLocaleString()}
+          </div>
+
+          <div>
+            Transfer Fees: $
+            {selected.audit_trace.cost.transfer.toLocaleString()}
+          </div>
+
+          <div>
+            Risk Premium: $
+            {selected.audit_trace.cost.scenario.toLocaleString()}
+          </div>
+        </div>
+
+        <div
+          className="audit-trace-box"
+          style={{
+            borderLeft: '4px solid #f59e0b'
+          }}
+        >
+          <div
+            style={{
+              marginBottom: '0.5rem',
+              fontWeight: 700,
+              color: '#f8fafc'
+            }}
+          >
+            Strategic Truth Anchor
+          </div>
+
+          <div>
+            Verified against Split-Node Forensic Architecture.
+            0ms co-location miracles detected.
+          </div>
+        </div>
+
+      </div>
+
+    ) : (
+
+      <div
+        style={{
+          textAlign: 'center',
+          color: '#64748b',
+          marginTop: '2rem'
+        }}
+      >
+        <Activity
+          size={48}
+          style={{
+            opacity: 0.1,
+            marginBottom: '1rem'
+          }}
+        />
+
+        <p style={{ fontSize: '0.8rem' }}>
+          Awaiting operational data stream...
+        </p>
+      </div>
+
+    )}
+
+    <div style={{ marginTop: 'auto' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
+          background: 'rgba(59, 130, 246, 0.1)',
+          padding: '0.75rem',
+          borderRadius: '8px',
+          border: '1px solid #3b82f6'
+        }}
+      >
+        <ShieldCheck size={16} color="#3b82f6" />
+
+        <span
+          style={{
+            fontSize: '0.65rem',
+            fontWeight: 800,
+            color: '#3b82f6'
+          }}
+        >
+          TRUTH AUDIT VERIFIED
+        </span>
+      </div>
+    </div>
+
+  </aside>
+
+  <footer className="tradeoff-strip">
+
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '0.75rem'
+      }}
+    >
+      <BarChart3 size={20} color="#64748b" />
+
+      <span
+        style={{
+          fontSize: '0.75rem',
+          fontWeight: 800,
+          color: '#64748b'
+        }}
+      >
+        TRADEOFF ANALYSIS
+      </span>
+    </div>
+
+    <div
+      style={{
+        display: 'flex',
+        gap: '3rem',
+        flex: 1,
+        justifyContent: 'center'
+      }}
+    >
+
+      <div
+        style={{
+          display: 'flex',
+          gap: '0.5rem',
+          alignItems: 'center'
+        }}
+      >
+        <span
+          style={{
+            fontSize: '0.7rem',
+            fontWeight: 700,
+            color: '#94a3b8'
+          }}
+        >
+          SELECTED ETA:
+        </span>
+
+        <span
+          style={{
+            fontSize: '0.9rem',
+            fontWeight: 800,
+            color: '#f59e0b'
+          }}
+        >
+          {selected?.adjusted_eta || '--'}h
+        </span>
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          gap: '0.5rem',
+          alignItems: 'center'
+        }}
+      >
+        <span
+          style={{
+            fontSize: '0.7rem',
+            fontWeight: 700,
+            color: '#94a3b8'
+          }}
+        >
+          LOWEST COST:
+        </span>
+
+        <span
+          style={{
+            fontSize: '0.9rem',
+            fontWeight: 800,
+            color: '#10b981'
+          }}
+        >
+          $
+          {recommendations.length > 0
+            ? Math.min(
+                ...recommendations.map(
+                  r => r.total_cost
+                )
+              ).toLocaleString()
+            : '--'}
+        </span>
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          gap: '0.5rem',
+          alignItems: 'center'
+        }}
+      >
+        <span
+          style={{
+            fontSize: '0.7rem',
+            fontWeight: 700,
+            color: '#94a3b8'
+          }}
+        >
+          RISK FLOOR:
+        </span>
+
+        <span
+          style={{
+            fontSize: '0.9rem',
+            fontWeight: 800,
+            color: '#3b82f6'
+          }}
+        >
+          {recommendations.length > 0
+            ? Math.min(
+                ...recommendations.map(
+                  r => r.threat_level * 100
+                )
+              )
+            : '--'}
+          %
+        </span>
+      </div>
+
+    </div>
+  </footer>
+
+</div>
+
+);
+};
+
+export default RouteRecommender;
