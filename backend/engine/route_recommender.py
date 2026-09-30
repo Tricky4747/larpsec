@@ -249,6 +249,18 @@ class RouteRecommender:
                             "p_quantile": ml_result.get("p_quantile"),
                             "reason": ml_result.get("calibration_reason")
                         })
+                        if ml_result.get("operating_range"):
+                            trace.setdefault("operating_ranges", []).append({
+                                "from": G_p.nodes[u].get("physical_id", u),
+                                "to": p_id,
+                                **ml_result["operating_range"]
+                            })
+                        if ml_result.get("shap_explanation"):
+                            trace.setdefault("shap_explanations", []).append({
+                                "from": G_p.nodes[u].get("physical_id", u),
+                                "to": p_id,
+                                **ml_result["shap_explanation"]
+                            })
                     else:
                         trace.setdefault("ml_predictions", []).append({
                             "from": G_p.nodes[u].get("physical_id", u),
