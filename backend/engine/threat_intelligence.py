@@ -6,7 +6,7 @@ import json
 import time
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
-import re  # add to the imports at the top
+import re
 
 # Load Production Artifacts
 MODEL_PATH = "./Execution/risk_model.pkl"
@@ -168,7 +168,7 @@ class ContrastiveNLPEngine:
             self.model = SentenceTransformer("all-MiniLM-L6-v2")
             self.util = util
             if os.path.exists(NLP_ANCHORS_PATH):
-                anchors = torch.load(NLP_ANCHORS_PATH)
+                anchors = torch.load(NLP_ANCHORS_PATH, map_location=torch.device("cpu"))
                 self.disaster_matrix = anchors["disaster_matrix"]
                 self.safe_matrix = anchors["safe_matrix"]
                 self._ready = True

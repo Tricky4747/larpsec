@@ -20,7 +20,7 @@ def test_nlp_anchors_audit():
         # Verification 1: Matrix Source
         print("\nVERIFYING MATRIX SOURCE:")
         if os.path.exists("Execution/nlp_anchors.pt"):
-            anchors = torch.load("Execution/nlp_anchors.pt")
+            anchors = torch.load(NLP_ANCHORS_PATH, map_location=torch.device("cpu"), weights_only=True)
             print(f"  Source Found: Execution/nlp_anchors.pt")
             print(f"  Corpus Version: {anchors.get('corpus_version')}")
             print(f"  Disaster Matrix Shape: {anchors['disaster_matrix'].shape}")
