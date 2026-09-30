@@ -1,210 +1,276 @@
-import numpy as np
-import joblib
-import os
-import torch
 import json
-import time
-from typing import List, Dict, Any, Optional, Tuple
-import pandas as pd
+import os
 import re
-import shap
+from typing import Any, Dict, List, Optional
 
-# Load Production Artifacts
-MODEL_PATH = "./Execution/risk_model.pkl"
-ENCODER_PATH = "./Execution/label_encoders.pkl"
-NLP_ANCHORS_PATH = "./Execution/nlp_anchors.pt"
-CALIBRATION_PATH = "./Execution/calibration_profiles.json"
+import joblib
+import numpy as np
+import pandas as pd
+import shap
+import torch
+
+
+BASE_DIR = os.path.dirname(__file__)
+MODEL_PATH = os.path.join(BASE_DIR, "Execution", "risk_model.pkl")
+ENCODER_PATH = os.path.join(BASE_DIR, "Execution", "label_encoders.pkl")
+NLP_ANCHORS_PATH = os.path.join(BASE_DIR, "Execution", "nlp_anchors.pt")
+CALIBRATION_PATH = os.path.join(BASE_DIR, "Execution", "calibration_profiles.json")
+
 
 class ThreatIntelligencePredictor:
     """
     Supplychainer Quantile ML Decision Brain.
-    V3: Statistically Defensible Calibration & Geographic Hub Intelligence.
+
+    Loads the p85 GradientBoostingRegressor, applies the historical calibration
+    floor/cap, and optionally exposes an exact TreeExplainer SHAP breakdown.
     """
-    def __init__(self, lazy_load=False):
+
+    def __init__(self, lazy_load: bool = False):
         self.is_trained = False
         self.model = None
         self.encoders = None
-        self.profiles = {}
+        self.profiles: Dict[str, Dict[str, float]] = {}
         self.explainer = None
-        
+        self.canonical_hub_map: Dict[str, Optional[str]] = {}
+
+        canonical_hubs_path = os.path.join(
+            BASE_DIR, "..", "data", "canonical_hubs.json"
+        )
+        try:
+            with open(canonical_hubs_path, "r", encoding="utf-8") as handle:
+                self.canonical_hub_map = {
+                    hub["id"]: hub.get("parent_city")
+                    for hub in json.load(handle)
+                    if hub.get("id")
+                }
+        except (OSError, json.JSONDecodeError, TypeError, KeyError):
+            self.canonical_hub_map = {}
+
         self.hub_map = {
-            "Seattle": "Seattle Port", "Seattle-Tacoma": "Seattle Port", "Seattle BNSF Terminal": "Seattle Port",
-            "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
-            "Los Angeles": "Los Angeles Port", "Salt Lake City": "Salt Lake City Hub", "Denver": "Denver Terminal",
-            "Phoenix": "Phoenix Logistics", "Dallas": "Dallas Corridor", "Alliance Texas Logistics Hub": "Dallas Corridor",
+            "Seattle": "Seattle Port",
+            "Seattle-Tacoma": "Seattle Port",
+            "Seattle BNSF Terminal": "Seattle Port",
+            "Portland": "Portland Terminal",
+            "San Francisco": "San Francisco Port",
+            "Los Angeles": "Los Angeles Port",
+            "Salt Lake City": "Salt Lake City Hub",
+            "Denver": "Denver Terminal",
+            "Phoenix": "Phoenix Logistics",
+            "Dallas": "Dallas Corridor",
+            "Alliance Texas Logistics Hub": "Dallas Corridor",
             "Houston": "Houston Port",
-            "Chicago": "Chicago Rail Hub", "Chicago Intermodal Complex": "Chicago Rail Hub", "Chicago O'Hare International": "Chicago Rail Hub",
+            "Chicago": "Chicago Rail Hub",
+            "Chicago Intermodal Complex": "Chicago Rail Hub",
+            "Chicago O'Hare International": "Chicago Rail Hub",
             "St. Louis": "St. Louis Hub",
-            "Atlanta": "Atlanta Air Hub", "Hartsfield-Jackson Atlanta": "Atlanta Air Hub",
-            "Miami": "Miami Port", "New York": "New York Port", "Boston": "Boston Terminal",
-            "Mumbai": "Mumbai Port", "Kochi": "Kochi Port", "Delhi": "Delhi Air Cargo", "Chennai": "Chennai Port",
-            "Shanghai": "Shanghai Port", "Singapore": "Singapore Port",
+            "Atlanta": "Atlanta Air Hub",
+            "Hartsfield-Jackson Atlanta": "Atlanta Air Hub",
+            "Miami": "Miami Port",
+            "New York": "New York Port",
+            "Boston": "Boston Terminal",
+            "Mumbai": "Mumbai Port",
+            "Kochi": "Kochi Port",
+            "Delhi": "Delhi Air Cargo",
+            "Chennai": "Chennai Port",
+            "Shanghai": "Shanghai Port",
+            "Singapore": "Singapore Port",
             "Rotterdam": "Rotterdam Port",
-            "Dubai": "Dubai Logistics Hub", "Al Maktoum International": "Dubai Logistics Hub",
+            "Dubai": "Dubai Logistics Hub",
+            "Al Maktoum International": "Dubai Logistics Hub",
             "Suez Canal": "Suez Canal",
         }
-        
+
         if not lazy_load:
             self.warmup()
 
     def warmup(self):
-        if self.is_trained: return
+        if self.is_trained:
+            return
+
         print("[PREDICTOR] Starting warmup...")
         if not os.path.exists(MODEL_PATH) or not os.path.exists(ENCODER_PATH):
-            print(f"CRITICAL: Production models missing. Running in deterministic fallback mode.")
+            print("[PREDICTOR] Production models missing; using deterministic fallback mode.")
             return
-            
-        # 1. Load ML Core
+
         self.model = joblib.load(MODEL_PATH)
         self.encoders = joblib.load(ENCODER_PATH)
         self.is_trained = True
 
-        # 1b. Build the SHAP explainer once, since it only needs the trained tree
-        # structure (no training data required) and is cheap to reuse per request.
         try:
             self.explainer = shap.TreeExplainer(self.model)
             print("[PREDICTOR] SHAP TreeExplainer ready.")
-        except Exception as e:
-            print(f"[PREDICTOR] SHAP explainer failed to initialize: {e}")
+        except Exception as exc:
+            print(f"[PREDICTOR] SHAP explainer failed to initialize: {exc}")
             self.explainer = None
-        
-        # 2. Load Statistically Defensible Calibration Profiles
-        if os.path.exists(CALIBRATION_PATH):
-            with open(CALIBRATION_PATH, 'r') as f:
-                self.profiles = json.load(f)
-            print(f"Calibration Layer: Loaded {len(self.profiles)} mode profiles from historical p5/p95 analysis.")
-        else:
-            print("WARNING: Calibration profiles missing. Using defensive fallbacks.")
-            self.profiles = {}
 
-        print(f"Supplychainer V3 Brain Loaded: Production-Ready.")
+        if os.path.exists(CALIBRATION_PATH):
+            try:
+                with open(CALIBRATION_PATH, "r", encoding="utf-8") as handle:
+                    self.profiles = json.load(handle)
+                print(
+                    f"[PREDICTOR] Loaded {len(self.profiles)} transport-mode "
+                    "calibration profiles."
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"[PREDICTOR] Calibration profiles failed to load: {exc}")
+                self.profiles = {}
+        else:
+            print("[PREDICTOR] Calibration profiles missing; using defensive fallbacks.")
 
     def _encode_feature(self, value: str, key: str):
-        """Case-insensitive lookup. Returns None if the value is not in the
-        training vocabulary (the old code silently used classes[0], so the model
-        predicted for a random lane)."""
+        """Case-insensitive encoder lookup; unknown values return None."""
+        if self.encoders is None or key not in self.encoders:
+            return None
+
         encoder = self.encoders[key]
-        lookup = {str(c).strip().lower(): c for c in encoder.classes_}
+        classes = list(encoder.classes_)
+        lookup = {str(item).strip().lower(): item for item in classes}
+
         candidates = [value]
         if key in ("Origin_Node", "Destination_Node"):
-            candidates.insert(0, self.hub_map.get(value, value))
-        for cand in candidates:
-            hit = lookup.get(str(cand).strip().lower())
+            parent_city = self.canonical_hub_map.get(value)
+            candidates.extend(
+                [
+                    self.hub_map.get(value),
+                    self.hub_map.get(parent_city) if parent_city else None,
+                    parent_city,
+                ]
+            )
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            hit = lookup.get(str(candidate).strip().lower())
             if hit is not None:
                 return int(encoder.transform([hit])[0])
+
         return None
 
-    def _explain_prediction(self, X_input: pd.DataFrame, origin: str, destination: str,
-                             transport_mode: str, leg_type: str, condition_flag: str) -> Optional[Dict[str, Any]]:
-        """
-        Decomposes this single prediction into per-feature contributions via SHAP.
-        Values sum exactly to (prediction - base_value), by construction.
-        Encoded categorical features are mapped back to their original human-readable
-        labels so the output is readable without needing the encoder to interpret it.
-        """
+    def _explain_prediction(
+        self,
+        X_input: pd.DataFrame,
+        origin: str,
+        destination: str,
+        transport_mode: str,
+        leg_type: str,
+        condition_flag: str,
+    ) -> Optional[Dict[str, Any]]:
         if self.explainer is None:
             return None
+
         try:
-            # Different shap/numpy versions return expected_value and shap_values with
-            # slightly different shapes (plain float, numpy scalar, or a length-1 array).
-            # Flatten defensively so float() always gets a true 0-dimensional value.
-            raw_shap = np.asarray(self.explainer.shap_values(X_input))
-            shap_values = raw_shap.reshape(-1)  # single row -> exactly len(X_input.columns) values
+            explanation = self.explainer(X_input)
+            shap_values = np.asarray(explanation.values).reshape(-1)
+            base_value = float(np.asarray(explanation.base_values).reshape(-1)[0])
 
-            raw_expected = self.explainer.expected_value
-            base_value = float(np.asarray(raw_expected).reshape(-1)[0])
-
-            # Human-readable label for each feature, not the raw encoded integer
             readable_values = {
-                'Leg_Type': leg_type,
-                'Origin_Node': origin,
-                'Destination_Node': destination,
-                'Transport_Mode': transport_mode,
-                'Condition_Flag': condition_flag,
-                'NLP_Severity_Score': round(float(X_input['NLP_Severity_Score'].iloc[0]), 3)
+                "Leg_Type": leg_type,
+                "Origin_Node": origin,
+                "Destination_Node": destination,
+                "Transport_Mode": transport_mode,
+                "Condition_Flag": condition_flag,
+                "NLP_Severity_Score": round(
+                    float(X_input["NLP_Severity_Score"].iloc[0]), 3
+                ),
             }
 
             contributions = [
                 {
-                    "feature": col,
-                    "value": readable_values.get(col, X_input[col].iloc[0]),
-                    "contribution_hours": round(float(shap_values[i]), 2)
+                    "feature": column,
+                    "value": readable_values.get(column, X_input[column].iloc[0]),
+                    "contribution_hours": round(float(shap_values[i]), 2),
                 }
-                for i, col in enumerate(X_input.columns)
+                for i, column in enumerate(X_input.columns)
             ]
-            # Largest absolute impact first, so the top driver of the delay is obvious at a glance
-            contributions.sort(key=lambda c: abs(c["contribution_hours"]), reverse=True)
+            contributions.sort(
+                key=lambda item: abs(item["contribution_hours"]),
+                reverse=True,
+            )
 
             return {
                 "base_value_hours": round(base_value, 2),
-                "contributions": contributions
+                "contributions": contributions,
             }
-        except Exception as e:
-            print(f"[SHAP] Explanation failed: {e}")
+        except Exception as exc:
+            print(f"[SHAP] Explanation failed: {exc}")
             return None
 
-    def predict_worst_case_delay(self, origin: str, destination: str, transport_mode: str, 
-                                 leg_type: str = "Global_Freight", condition_flag: str = "Clear", 
-                                 nlp_score: float = 0.0) -> Dict[str, Any]:
-        """
-        Stage 4: p85 Quantile Prediction with Statistically Defensible Calibration.
-        """
+    def _fallback_prediction(self, transport_mode: str, reason: str):
+        priors = {"road": 2.5, "sea": 48.0, "air": 12.0, "rail": 18.0}
+        delay = priors.get((transport_mode or "").strip().lower(), 12.0)
+        return {
+            "raw_model_prediction": delay,
+            "calibrated_delay": delay,
+            "baseline_systemic_friction": delay,
+            "final_delay_presented": delay,
+            "calibration_reason": reason,
+            "p_quantile": 0.85,
+            "is_defensible": True,
+            "shap_explanation": None,
+        }
+
+    def predict_worst_case_delay(
+        self,
+        origin: str,
+        destination: str,
+        transport_mode: str,
+        leg_type: str = "Global_Freight",
+        condition_flag: str = "Clear",
+        nlp_score: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Run the p85 prediction and return calibrated delay + SHAP."""
         if not self.is_trained:
-            mode_key = transport_mode.lower()
-            priors = {"road": 2.5, "sea": 48.0, "air": 12.0, "rail": 18.0}
-            delay = priors.get(mode_key, 12.0)
-            return {
-                "raw_model_prediction": delay,
-                "calibrated_delay": delay,
-                "baseline_systemic_friction": delay,
-                "final_delay_presented": delay,
-                "calibration_reason": "Deterministic Operational Prior (Engine Warming)",
-                "p_quantile": 0.85,
-                "is_defensible": True
+            return self._fallback_prediction(
+                transport_mode,
+                "Deterministic Operational Prior (Engine Warming)",
+            )
+
+        try:
+            features = {
+                "Leg_Type": self._encode_feature(leg_type, "Leg_Type"),
+                "Origin_Node": self._encode_feature(origin, "Origin_Node"),
+                "Destination_Node": self._encode_feature(destination, "Destination_Node"),
+                "Transport_Mode": self._encode_feature(transport_mode, "Transport_Mode"),
+                "Condition_Flag": self._encode_feature(condition_flag, "Condition_Flag"),
+                "NLP_Severity_Score": float(nlp_score),
             }
 
-        # t_ml_start = time.perf_counter()
-        try:
-            feat_origin = self._encode_feature(origin, 'Origin_Node')
-            feat_dest = self._encode_feature(destination, 'Destination_Node')
-            feat_mode = self._encode_feature(transport_mode, 'Transport_Mode')
-            feat_leg = self._encode_feature(leg_type, 'Leg_Type')
-            feat_cond = self._encode_feature(condition_flag, 'Condition_Flag')
-            if None in (feat_origin, feat_dest, feat_mode, feat_leg, feat_cond):
-                return {"final_delay_presented": 0.0, "covered": False,
-                        "calibration_reason": "Lane not in model training vocabulary"}
-            
-            X_input = pd.DataFrame([{'Leg_Type': feat_leg, 'Origin_Node': feat_origin, 'Destination_Node': feat_dest,
-                                     'Transport_Mode': feat_mode, 'Condition_Flag': feat_cond, 'NLP_Severity_Score': nlp_score}])
-            
-            # 1. Raw p85 Inference
+            if any(features[key] is None for key in features if key != "NLP_Severity_Score"):
+                return {
+                    "final_delay_presented": 0.0,
+                    "covered": False,
+                    "calibration_reason": "Lane not in model training vocabulary",
+                    "shap_explanation": None,
+                }
+
+            X_input = pd.DataFrame([features])
             raw_prediction = float(self.model.predict(X_input)[0])
 
-            # 1b. SHAP explainability for this specific prediction (exact, not approximate,
-            # for tree models — TreeExplainer walks the trained tree structure directly).
-            shap_breakdown = self._explain_prediction(X_input, origin, destination,
-                                                        transport_mode, leg_type, condition_flag)
+            shap_breakdown = self._explain_prediction(
+                X_input,
+                origin,
+                destination,
+                transport_mode,
+                leg_type,
+                condition_flag,
+            )
 
-            # 2. Statistical Calibration (Derived from Historical p95)
-            mode_key = transport_mode.lower()
+            mode_key = (transport_mode or "").strip().lower()
             profile = self.profiles.get(mode_key, {"floor": 0.0, "cap": 240.0})
-            
-            floor = profile["floor"]
-            cap = profile["cap"]
-            
+            floor = float(profile.get("floor", 0.0))
+            cap = float(profile.get("cap", 240.0))
+
             calibrated_delay = min(max(0.0, raw_prediction), cap)
-            
-            # 3. Restore Systemic Friction (p5 Baseline)
             final_delay = max(calibrated_delay, floor)
-            
-            # Explainability
-            reason = "Optimal Flow"
+
             if final_delay == floor and calibrated_delay < floor:
                 reason = f"Baseline Operational Friction (Historical p5: {floor}h)"
             elif calibrated_delay < raw_prediction:
                 reason = f"Operational Cap Applied (Historical p95 Bound: {cap}h)"
             elif raw_prediction > floor:
                 reason = "Quantile Disruption Prediction (p85 Risk)"
+            else:
+                reason = "Optimal Flow"
 
             return {
                 "raw_model_prediction": round(raw_prediction, 2),
@@ -214,100 +280,139 @@ class ThreatIntelligencePredictor:
                 "calibration_reason": reason,
                 "p_quantile": 0.85,
                 "is_defensible": True,
-                # Named "operating_range" rather than "confidence_band" on purpose:
-                # p85 is a real per-request model prediction, but floor/cap are static
-                # historical bounds per transport mode, not per-request quantiles.
                 "operating_range": {
                     "p5_floor": floor,
                     "p85_prediction": round(raw_prediction, 2),
-                    "p95_cap": cap
+                    "p95_cap": cap,
                 },
-                "shap_explanation": shap_breakdown
+                "shap_explanation": shap_breakdown,
             }
-            
-        except Exception as e:
-            print(f"Calibration Inference Error: {e}")
-            return {"final_delay_presented": 0.0, "covered": False, "calibration_reason": "Inference Error"}
+
+        except ValueError:
+            return self._fallback_prediction(
+                transport_mode,
+                "Deterministic Operational Prior (Unknown Hub)",
+            )
+        except Exception as exc:
+            print(f"[PREDICTOR] Calibration inference error: {exc}")
+            return self._fallback_prediction(
+                transport_mode,
+                "Deterministic Operational Prior (Inference Fallback)",
+            )
+
 
 class ContrastiveNLPEngine:
-    """Stage 2: PRODUCTION Contrastive NLP Brain."""
-    def __init__(self, lazy_load=False):
+    """Stage 2: production contrastive NLP brain."""
+
+    def __init__(self, lazy_load: bool = False):
         self._ready = False
+        self.last_margin = None
         self.noise_floor = 0.04
-        # Realistic contrastive margins from all-MiniLM-L6-v2 on supply-chain
-        # anchors range 0.05 (mild disruption) to 0.40 (severe blockage/strike).
-        # We map that range to [0, 1] by dividing by the expected maximum.
-        # min(1.0, ...) clamps any outlier margin above 0.40.
         self.max_expected_margin = 0.40
         if not lazy_load:
             self.warmup()
 
     def warmup(self):
-        if self._ready: return
+        if self._ready:
+            return
+
         print("[NLP ENGINE] Starting warmup...")
         try:
             from sentence_transformers import SentenceTransformer, util
+
             self.model = SentenceTransformer("all-MiniLM-L6-v2")
             self.util = util
+
             if os.path.exists(NLP_ANCHORS_PATH):
-                anchors = torch.load(NLP_ANCHORS_PATH, map_location=torch.device("cpu"))
+                anchors = torch.load(
+                    NLP_ANCHORS_PATH,
+                    map_location=torch.device("cpu"),
+                )
                 self.disaster_matrix = anchors["disaster_matrix"]
                 self.safe_matrix = anchors["safe_matrix"]
                 self._ready = True
-                print(f"NLP Brain: Loaded Historical Anchor Matrix.")
-            else:
-                self._ready = False
-        except Exception as e:
-            print(f"[NLP ENGINE] Warmup failed: {e}")
+                print("[NLP ENGINE] Loaded historical anchor matrix.")
+        except Exception as exc:
+            print(f"[NLP ENGINE] Warmup failed: {exc}")
             self._ready = False
 
     def get_semantic_score(self, news_text: str) -> float:
-        if not self._ready: return 0.0
-        if not news_text or len(news_text.strip()) < 5: return 0.0
-        chunks = [news_text[i:i+256] for i in range(0, len(news_text), 256)]
+        if not self._ready or not news_text or len(news_text.strip()) < 5:
+            return 0.0
+
+        chunks = [news_text[i : i + 256] for i in range(0, len(news_text), 256)]
         chunk_embeddings = self.model.encode(chunks, convert_to_tensor=True)
-        d_scores = self.util.cos_sim(chunk_embeddings, self.disaster_matrix)
-        s_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
-        margin = float(np.max(d_scores.cpu().numpy())) - float(np.max(s_scores.cpu().numpy()))
+        disaster_scores = self.util.cos_sim(
+            chunk_embeddings, self.disaster_matrix
+        )
+        safe_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
+
+        margin = float(np.max(disaster_scores.cpu().numpy())) - float(
+            np.max(safe_scores.cpu().numpy())
+        )
+        self.last_margin = margin
+
         if margin < self.noise_floor:
             return 0.0
         return float(min(1.0, margin / self.max_expected_margin))
 
+
 class CARFFilter:
-    """Stage 3: TRUE CARF (Context-Aware Relevance Filter)."""
+    """Stage 3: context-aware relevance filter."""
 
     def __init__(self):
         self.relevance_map = {
-            "air":  ["airport", "flight", "airspac", "aviat", "runway"],
-            "sea":  ["port", "vessel", "ship", "canal", "ocean", "maritim", "dock", "freight"],
-            "rail": ["rail", "track", "locomot", "station"],
-            "road": ["highway", "truck", "traff", "bridge", "road", "deliver"]
+            "air": [
+                "airport", "airports", "flight", "flights",
+                "airspace", "aviation", "runway", "terminal", "terminals",
+            ],
+            "sea": [
+                "port", "ports", "vessel", "vessels", "ship", "ships",
+                "canal", "ocean", "maritime", "dock", "docks", "freight",
+            ],
+            "rail": [
+                "rail", "railway", "railways", "track", "tracks",
+                "locomotive", "locomotives", "station", "stations",
+            ],
+            "road": [
+                "highway", "truck", "trucks", "traffic",
+                "bridge", "road", "roads", "delivery",
+            ],
         }
 
     def _matches_mode(self, words: set, mode: str) -> bool:
-        stems = self.relevance_map.get(mode, [])
-        return any(word.startswith(stem) for word in words for stem in stems)
+        keywords = self.relevance_map.get(mode, [])
+        return any(
+            word == keyword or word.startswith(keyword)
+            for word in words
+            for keyword in keywords
+        )
 
-    def apply_filter(self, semantic_score: float, news_context: str, transport_mode: str) -> float:
+    def apply_filter(
+        self,
+        semantic_score: float,
+        news_context: str,
+        transport_mode: str,
+    ) -> float:
         if semantic_score <= 0:
             return 0.0
 
-        mode = transport_mode.lower()
+        mode = (transport_mode or "").strip().lower()
         if mode not in self.relevance_map:
-            return semantic_score
+            return float(semantic_score)
 
-        words = set(re.findall(r"[a-z]+", news_context.lower()))
-
+        words = set(re.findall(r"[a-z0-9]+", news_context.lower()))
         matches_own = self._matches_mode(words, mode)
         matches_other = any(
-            self._matches_mode(words, m)
-            for m in self.relevance_map
-            if m != mode
+            self._matches_mode(words, other_mode)
+            for other_mode in self.relevance_map
+            if other_mode != mode
         )
 
         if matches_other and not matches_own:
             return 0.0
-        return semantic_score
+
+        return float(semantic_score)
 
     def max_pool_threats(self, scores: List[float]) -> float:
         return float(np.max(scores)) if scores else 0.0
