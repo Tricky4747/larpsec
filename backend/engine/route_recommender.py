@@ -1,414 +1,313 @@
-import networkx as nx
-import math
+import numpy as np
+import joblib
+import os
+import torch
+import json
 import time
-from typing import List, Dict, Any, Optional
-from .multimodal_network import MODE_PROFILES, create_multimodal_network
-from .threat_intelligence import ThreatIntelligencePredictor, ContrastiveNLPEngine, CARFFilter
-from .news_ingestion import DynamicNewsIngestor
-from .node_resolver import NodeResolver
+from typing import List, Dict, Any, Optional, Tuple
+import pandas as pd
+import re
+import shap
 
-PERSONAS = ["FASTEST", "SAFEST", "BALANCED"]
+# Load Production Artifacts
+MODEL_PATH = "./Execution/risk_model.pkl"
+ENCODER_PATH = "./Execution/label_encoders.pkl"
+NLP_ANCHORS_PATH = "./Execution/nlp_anchors.pt"
+CALIBRATION_PATH = "./Execution/calibration_profiles.json"
 
-
-class RouteRecommender:
+class ThreatIntelligencePredictor:
     """
-    Supplychainer Unified Multimodal Optimization Engine.
-    V8: Virtual-Node Forensic Edition.
-
-    Patched: live news -> NLP -> CARF now drives threat on the corridor being
-    routed, and the p85 quantile model adds a worst-case delay buffer to the
-    SAFEST and BALANCED weights. Both are computed lazily for candidate-path
-    edges only (not the whole graph) and iterated until the candidate set is stable.
+    Supplychainer Quantile ML Decision Brain.
+    V3: Statistically Defensible Calibration & Geographic Hub Intelligence.
     """
+    def __init__(self, lazy_load=False):
+        self.is_trained = False
+        self.model = None
+        self.encoders = None
+        self.profiles = {}
+        self.explainer = None
+        
+        self.hub_map = {
+            "Seattle": "Seattle Port", "Seattle-Tacoma": "Seattle Port", "Seattle BNSF Terminal": "Seattle Port",
+            "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
+            "Los Angeles": "Los Angeles Port", "Salt Lake City": "Salt Lake City Hub", "Denver": "Denver Terminal",
+            "Phoenix": "Phoenix Logistics", "Dallas": "Dallas Corridor", "Alliance Texas Logistics Hub": "Dallas Corridor",
+            "Houston": "Houston Port",
+            "Chicago": "Chicago Rail Hub", "Chicago Intermodal Complex": "Chicago Rail Hub", "Chicago O'Hare International": "Chicago Rail Hub",
+            "St. Louis": "St. Louis Hub",
+            "Atlanta": "Atlanta Air Hub", "Hartsfield-Jackson Atlanta": "Atlanta Air Hub",
+            "Miami": "Miami Port", "New York": "New York Port", "Boston": "Boston Terminal",
+            "Mumbai": "Mumbai Port", "Kochi": "Kochi Port", "Delhi": "Delhi Air Cargo", "Chennai": "Chennai Port",
+            "Shanghai": "Shanghai Port", "Singapore": "Singapore Port",
+            "Rotterdam": "Rotterdam Port",
+            "Dubai": "Dubai Logistics Hub", "Al Maktoum International": "Dubai Logistics Hub",
+            "Suez Canal": "Suez Canal",
+        }
+        
+        if not lazy_load:
+            self.warmup()
 
-    def __init__(self, network, predictor, simulator, scenario_mgr, demo_mode=False):
-        self.network = network # Legacy
-        self.predictor = predictor
-        self.simulator = simulator
-        self.scenario_mgr = scenario_mgr
-        self.demo_mode = demo_mode
-        self.is_warmed_up = False
-        self.warmup_failed = False
+    def warmup(self):
+        if self.is_trained: return
+        print("[PREDICTOR] Starting warmup...")
+        if not os.path.exists(MODEL_PATH) or not os.path.exists(ENCODER_PATH):
+            print(f"CRITICAL: Production models missing. Running in deterministic fallback mode.")
+            return
+            
+        # 1. Load ML Core
+        self.model = joblib.load(MODEL_PATH)
+        self.encoders = joblib.load(ENCODER_PATH)
+        self.is_trained = True
 
-        self.nlp = ContrastiveNLPEngine(lazy_load=True)
-        self.carf = CARFFilter()
-        self.news_ingestor = DynamicNewsIngestor()
-        self.resolver = NodeResolver()
-
-        self._score_cache = {}   # (news_text, mode) -> CARF-filtered threat
-        self._ml_cache = {}      # (origin, dest, mode, nlp_bucket) -> p85 hours or None
-
-        print(f"[STARTUP] Initializing Split-Node Global Topology...")
-        self.unified_graph = create_multimodal_network()
-
-
-        if self.demo_mode:
-            print("[DEMO MODE] Running synchronous warmup...")
-            self.run_background_warmup()
-
-        print(f"[STARTUP] Unified Engine Ready.")
-
-    def run_background_warmup(self):
-        if self.is_warmed_up: return
-        print("[WARMUP] Calibrating global threat floor...")
+        # 1b. Build the SHAP explainer once, since it only needs the trained tree
+        # structure (no training data required) and is cheap to reuse per request.
         try:
-            self.predictor.warmup()
-            self.nlp.warmup()
-
-            # Offline baseline intelligence (used when live news is unavailable)
-            for u, v, d in self.unified_graph.edges(data=True):
-                mode = d.get("transport_mode", "road")
-                if mode == "transfer": continue
-                news = self.news_ingestor.fallback_news.get(mode, "Normal conditions.")
-                score = self.nlp.get_semantic_score(news)
-                threat = self.carf.apply_filter(score, news, mode)
-                self.unified_graph[u][v]["base_threat"] = threat
-                self.unified_graph[u][v]["base_news"] = news
-
-            self.is_warmed_up = True
-            print("[WARMUP] Unified Calibration Complete.")
+            self.explainer = shap.TreeExplainer(self.model)
+            print("[PREDICTOR] SHAP TreeExplainer ready.")
         except Exception as e:
-            print(f"[WARMUP] Error during warmup: {e}")
-            self.warmup_failed = True
-
-    # ------------------------------------------------------------------
-    # Live intelligence + ML buffer (computed only for edges we actually consider)
-    # ------------------------------------------------------------------
-    def _live_intel(self, G, pairs):
-        """pairs: [(physical_id, mode)] -> {(physical_id, mode): {threat, news, source}}"""
-        keyed = []
-        for pid, mode in pairs:
-            node = f"{pid}:{mode}"
-            name = G.nodes[node].get("display_name", pid) if node in G else pid
-            keyed.append(((pid, mode), (name, mode)))
-
-        fetched = self.news_ingestor.prefetch([k for _, k in keyed])
-        out = {}
-        for pair, k in keyed:
-            text, source = fetched[k]
-            ck = (text, pair[1])
-            if ck not in self._score_cache:
-                score = self.nlp.get_semantic_score(text)          # 0.0 if NLP not ready
-                self._score_cache[ck] = self.carf.apply_filter(score, text, pair[1])
-            out[pair] = {"threat": self._score_cache[ck], "news": text, "source": source}
-        return out
-
-    def _ml_buffer(self, G, u, v, nlp_score, disruptions=None):
-        if not getattr(self.predictor, "is_trained", False):
-            return None
-        d = G[u][v]
-        disruptions = disruptions or {}
-
-        # Derive condition from active disruptions on the destination node
-        p_id = G.nodes[v].get("physical_id", "")
-        if p_id in disruptions:
-            threat_level = disruptions[p_id].get("threat", 0.0)
-            condition_flag = "Disrupted" if threat_level >= 0.75 else "Degraded"
+            print(f"[PREDICTOR] SHAP explainer failed to initialize: {e}")
+            self.explainer = None
+        
+        # 2. Load Statistically Defensible Calibration Profiles
+        if os.path.exists(CALIBRATION_PATH):
+            with open(CALIBRATION_PATH, 'r') as f:
+                self.profiles = json.load(f)
+            print(f"Calibration Layer: Loaded {len(self.profiles)} mode profiles from historical p5/p95 analysis.")
         else:
-            condition_flag = "Clear"
+            print("WARNING: Calibration profiles missing. Using defensive fallbacks.")
+            self.profiles = {}
 
-        key = (G.nodes[u].get("display_name"), G.nodes[v].get("display_name"),
-            d["transport_mode"], round(nlp_score, 1), condition_flag)
+        print(f"Supplychainer V3 Brain Loaded: Production-Ready.")
 
-        if key not in self._ml_cache:
-            try:
-                r = self.predictor.predict_worst_case_delay(
-                    key[0], key[1], key[2],
-                    nlp_score=nlp_score,
-                    condition_flag=condition_flag
-                )
-                self._ml_cache[key] = float(r["final_delay_presented"]) if r.get("covered", True) else None
-            except Exception as e:
-                print(f"[ML] p85 lookup failed for {key}: {e}")
-                self._ml_cache[key] = None
-        return self._ml_cache[key]
-    def _enrich(self, G, edges, disruptions, intel, buffers):
-        transit = [(u, v) for u, v in edges if G[u][v]["type"] != "transfer"]
-        pairs = {(G.nodes[v].get("physical_id"), G[u][v]["transport_mode"]) for u, v in transit}
-        pairs = [p for p in pairs if p not in intel]
-        if pairs:
-            intel.update(self._live_intel(G, pairs))
-        for u, v in transit:
-            d = G[u][v]
-            pid = G.nodes[v].get("physical_id")
-            # Scenario delay already dominates a disrupted hub; don't stack the model on top.
-            if pid in disruptions:
-                buffers[(u, v)] = None
-                continue
-            threat = self._edge_threat(d, pid, d["transport_mode"], intel)
-            buffers[(u, v)] = self._ml_buffer(G, u, v, threat, disruptions=disruptions)
+    def _encode_feature(self, value: str, key: str):
+        """Case-insensitive lookup. Returns None if the value is not in the
+        training vocabulary (the old code silently used classes[0], so the model
+        predicted for a random lane)."""
+        encoder = self.encoders[key]
+        lookup = {str(c).strip().lower(): c for c in encoder.classes_}
+        candidates = [value]
+        if key in ("Origin_Node", "Destination_Node"):
+            candidates.insert(0, self.hub_map.get(value, value))
+        for cand in candidates:
+            hit = lookup.get(str(cand).strip().lower())
+            if hit is not None:
+                return int(encoder.transform([hit])[0])
+        return None
 
-    @staticmethod
-    def _edge_threat(d, p_id, mode, intel):
-        live = intel.get((p_id, mode))
-        if live and live["source"] == "LIVE":
-            return live["threat"]
-        return d.get("base_threat", 0.05)
-
-    # ------------------------------------------------------------------
-    def recommend(self, source: str, destination: str, transport_preference: str = "any",
-                  routing_policy: str = "STRICT", cargo_type: str = "general",
-                  priority: str = "normal", scenario: str = None,
-                  overrides: dict = None) -> dict:
-        t0 = time.perf_counter()
-        overrides = overrides or {}
-        avoid_hubs = overrides.get("avoid_chokepoints", [])
-        cost_ceiling = overrides.get("cost_ceiling", 999999)
-        max_delay = overrides.get("max_delay", 9999)
-
-        # 1. Resolve Entry/Exit (Virtual Nodes)
-        res_s = self.resolver.resolve_node_to_entry_point(source)
-        res_d = self.resolver.resolve_node_to_entry_point(destination)
-
-        if "error" in res_s: return {"error": res_s["error"]}
-        if "error" in res_d: return {"error": res_d["error"]}
-
-        s_vnode, d_vnode = res_s["id"], res_d["id"]
-
-        # 2. Scenario Activation
-        active_scenario = self.scenario_mgr.activate_scenario(scenario)
-        disruptions = self.scenario_mgr.get_active_disruptions()
-
-        G_base = self.unified_graph.copy()
-        for hub_id in avoid_hubs:
-            G_base.remove_nodes_from([n for n, d in G_base.nodes(data=True)
-                                      if d.get("physical_id") == hub_id])
-        refs = {
-            "air":     self._reference_route(G_base, s_vnode, d_vnode, ["air", "transfer", "road"], disruptions),
-            "surface": self._reference_route(G_base, s_vnode, d_vnode, ["sea", "rail", "road", "transfer"], disruptions),
-        }
-
-        # Persona graph: the STRICT filter is identical for every persona, so build it once.
-        G_p = G_base
-        if transport_preference != "any" and routing_policy == "STRICT":
-            allowed_modes = [transport_preference, "transfer", "road"]
-            G_p.remove_edges_from([(u, v) for u, v, d in G_p.edges(data=True)
-                                   if d["transport_mode"] not in allowed_modes])
-
-        intel: Dict[Any, Any] = {}      # (physical_id, mode) -> live intel
-        buffers: Dict[Any, Any] = {}    # (u, v) -> p85 buffer hours (None = not covered)
-
-        def make_weight(persona):
-            def weight_func(u, v, d):
-                mode = d["transport_mode"]
-                base_t = d["baseline_time"]
-                base_c = d.get("cost", 0)
-                p_id = G_p.nodes[v].get("physical_id")
-
-                threat = self._edge_threat(d, p_id, mode, intel)
-                delay = 0
-                if p_id in disruptions:
-                    threat = max(threat, disruptions[p_id]["threat"])
-                    delay += disruptions[p_id]["delay"]
-                buf = buffers.get((u, v)) or 0.0
-
-                if persona == "FASTEST":
-                    return base_t + delay
-                elif persona == "SAFEST":
-                    return (base_t + delay + buf) * (1.0 + threat * 12.0)
-                else:  # BALANCED
-                    return ((base_t + delay + buf) * 0.3
-                            + (base_c / 150.0) * 0.5
-                            + (threat * 40.0) * 0.2)
-            return weight_func
-
-        # 3a. Discovery: route with what we know, fetch intel for the edges those routes use,
-        #     re-route, repeat until no new edges show up (max 3 rounds).
-        seen_edges = set()
-        for _ in range(3):
-            edges = set()
-            for persona in PERSONAS:
-                try:
-                    p = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=make_weight(persona))
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    continue
-                edges.update(zip(p, p[1:]))
-            fresh = edges - seen_edges
-            if not fresh:
-                break
-            self._enrich(G_p, fresh, disruptions, intel, buffers)
-            seen_edges |= fresh
-
-        # 3b. Final persona optimization
-        candidates = []
-        for persona in PERSONAS:
-            try:
-                path = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=make_weight(persona))
-
-                legs = []
-                total_time, total_cost, max_threat, total_buffer = 0, 0, 0, 0.0
-                trace = {
-                    "eta": {"transit": 0, "transfer": 0, "scenario": 0, "p85_buffer": 0},
-                    "cost": {"transit": 0, "transfer": 0, "scenario": 0},
-                    "risk": {"baseline": 0, "scenario": 0}
-                }
-
-                for i in range(len(path)-1):
-                    u, v = path[i], path[i+1]
-                    d = G_p[u][v]
-                    mode = d["transport_mode"]
-                    v_data = G_p.nodes[v]
-                    p_id = v_data.get("physical_id")
-
-                    l_time = d["baseline_time"]
-                    l_cost = d.get("cost", 0)
-                    l_delay = 0.0
-                    l_premium = 0.0
-                    l_threat = d.get("base_threat", 0.05)
-                    l_news = d.get("base_news", "Standard conditions")
-                    l_source = "FALLBACK"
-
-                    live = intel.get((p_id, mode))
-                    if live and live["source"] == "LIVE":
-                        l_threat = live["threat"]
-                        l_news = live["news"]
-                        l_source = "LIVE"
-
-                    if p_id in disruptions:
-                        l_delay = disruptions[p_id]["delay"]
-                        l_premium = l_cost * 0.1
-                        l_threat = max(l_threat, disruptions[p_id]["threat"])
-                        l_news = disruptions[p_id]["reason"]
-                        l_source = "SCENARIO"
-                        trace["eta"]["scenario"] += l_delay
-                        trace["cost"]["scenario"] += l_premium
-                        trace["risk"]["scenario"] = max(trace["risk"]["scenario"], l_threat)
-
-                    l_buffer = buffers.get((u, v))
-
-                    if d["type"] == "transfer":
-                        trace["eta"]["transfer"] += l_time
-                        trace["cost"]["transfer"] += l_cost
-                    else:
-                        trace["eta"]["transit"] += l_time
-                        trace["cost"]["transit"] += l_cost
-                        trace["risk"]["baseline"] = max(trace["risk"]["baseline"], l_threat)
-
-                    if l_buffer:
-                        trace["eta"]["p85_buffer"] += l_buffer
-                        total_buffer += l_buffer
-
-                    total_time += l_time + l_delay
-                    total_cost += l_cost + l_premium
-                    max_threat = max(max_threat, l_threat)
-
-                    legs.append({
-                        "from": G_p.nodes[u].get("physical_id", u),
-                        "to": p_id,
-                        "to_name": v_data.get("display_name", p_id),
-                        "mode": mode.upper(),
-                        "type": d["type"],
-                        "eta": round(l_time + l_delay, 1),
-                        "eta_transit": round(l_time, 1),
-                        "eta_delay": round(l_delay, 1),
-                        "cost": round(l_cost + l_premium, 2),
-                        "cost_base": round(l_cost, 2),
-                        "cost_premium": round(l_premium, 2),
-                        "p85_buffer": round(l_buffer, 1) if l_buffer is not None else None,
-                        "threat": round(l_threat, 2),
-                        "reason": l_news,
-                        "intel_source": l_source
-                    })
-
-                if total_cost > cost_ceiling or total_time > (max_delay * 24): continue
-
-                candidates.append({
-                    "persona": persona,
-                    "primary_mode": "MULTIMODAL",
-                    "legs": legs,
-                    "adjusted_eta": round(total_time, 1),
-                    "p85_eta": round(total_time + total_buffer, 1),
-                    "total_cost": round(total_cost, 2),
-                    "threat_level": round(max_threat, 2),
-                    "audit_trace": trace,
-                    "override_applied": bool(avoid_hubs or cost_ceiling < 999999)
-                })
-
-            except nx.NetworkXNoPath:
-                continue
-            except Exception as e:
-                print(f"[ROUTING ERROR] {persona}: {e}")
-
-        if not candidates:
-            return {"error": "No valid multimodal route established under current strategic constraints."}
-
-        # Deduplicate and sort
-        final = []
-        seen = set()
-        for c in sorted(candidates, key=lambda x: x["adjusted_eta"]):
-            path_sig = tuple((l["mode"], l["to"]) for l in c["legs"])
-            if path_sig not in seen:
-                final.append(c)
-                seen.add(path_sig)
-        peer_threats = [c["threat_level"] for c in final]
-        for c in final:
-            c["explanation"] = self._generate_forensic_explanation(
-                c["persona"], c["audit_trace"], c["threat_level"], c["legs"], refs, peer_threats)
-        return {
-            "origin": source, "destination": destination,
-            "active_scenario": active_scenario["name"] if active_scenario else None,
-            "recommendations": final[:3]
-        }
-
-    def _reference_route(self, G, s_vnode, d_vnode, allowed_modes, disruptions):
-        """Single-mode baseline (pure AIR / pure surface) for explanations. None if no route."""
-        G_ref = G.copy()
-        G_ref.remove_edges_from([(u, v) for u, v, d in G_ref.edges(data=True)
-                                 if d["transport_mode"] not in allowed_modes])
+    def _explain_prediction(self, X_input: pd.DataFrame, origin: str, destination: str,
+                             transport_mode: str, leg_type: str, condition_flag: str) -> Optional[Dict[str, Any]]:
+        """
+        Decomposes this single prediction into per-feature contributions via SHAP.
+        Values sum exactly to (prediction - base_value), by construction.
+        Encoded categorical features are mapped back to their original human-readable
+        labels so the output is readable without needing the encoder to interpret it.
+        """
+        if self.explainer is None:
+            return None
         try:
-            path = nx.dijkstra_path(G_ref, s_vnode, d_vnode, weight="baseline_time")
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            # Different shap/numpy versions return expected_value and shap_values with
+            # slightly different shapes (plain float, numpy scalar, or a length-1 array).
+            # Flatten defensively so float() always gets a true 0-dimensional value.
+            raw_shap = np.asarray(self.explainer.shap_values(X_input))
+            shap_values = raw_shap.reshape(-1)  # single row -> exactly len(X_input.columns) values
+
+            raw_expected = self.explainer.expected_value
+            base_value = float(np.asarray(raw_expected).reshape(-1)[0])
+
+            # Human-readable label for each feature, not the raw encoded integer
+            readable_values = {
+                'Leg_Type': leg_type,
+                'Origin_Node': origin,
+                'Destination_Node': destination,
+                'Transport_Mode': transport_mode,
+                'Condition_Flag': condition_flag,
+                'NLP_Severity_Score': round(float(X_input['NLP_Severity_Score'].iloc[0]), 3)
+            }
+
+            contributions = [
+                {
+                    "feature": col,
+                    "value": readable_values.get(col, X_input[col].iloc[0]),
+                    "contribution_hours": round(float(shap_values[i]), 2)
+                }
+                for i, col in enumerate(X_input.columns)
+            ]
+            # Largest absolute impact first, so the top driver of the delay is obvious at a glance
+            contributions.sort(key=lambda c: abs(c["contribution_hours"]), reverse=True)
+
+            return {
+                "base_value_hours": round(base_value, 2),
+                "contributions": contributions
+            }
+        except Exception as e:
+            print(f"[SHAP] Explanation failed: {e}")
             return None
 
-        eta = cost = 0.0
-        for u, v in zip(path, path[1:]):
-            d = G_ref[u][v]
-            leg_t, leg_c = d["baseline_time"], d.get("cost", 0.0)
-            hit = disruptions.get(G_ref.nodes[v].get("physical_id"))
-            if hit:
-                leg_t += hit["delay"]
-                leg_c += leg_c * 0.1
-            eta += leg_t
-            cost += leg_c
-        return {"eta": round(eta, 1), "cost": round(cost, 2)}
+    def predict_worst_case_delay(self, origin: str, destination: str, transport_mode: str, 
+                                 leg_type: str = "Global_Freight", condition_flag: str = "Clear", 
+                                 nlp_score: float = 0.0) -> Dict[str, Any]:
+        """
+        Stage 4: p85 Quantile Prediction with Statistically Defensible Calibration.
+        """
+        if not self.is_trained:
+            mode_key = transport_mode.lower()
+            priors = {"road": 2.5, "sea": 48.0, "air": 12.0, "rail": 18.0}
+            delay = priors.get(mode_key, 12.0)
+            return {
+                "raw_model_prediction": delay,
+                "calibrated_delay": delay,
+                "baseline_systemic_friction": delay,
+                "final_delay_presented": delay,
+                "calibration_reason": "Deterministic Operational Prior (Engine Warming)",
+                "p_quantile": 0.85,
+                "is_defensible": True
+            }
 
-    def _generate_forensic_explanation(self, persona, trace, threat, legs, refs, peer_threats):
-        eta = trace["eta"]["transit"] + trace["eta"]["transfer"] + trace["eta"]["scenario"]
-        cost = trace["cost"]["transit"] + trace["cost"]["transfer"] + trace["cost"]["scenario"]
-        transfer_count = sum(1 for l in legs if l["type"] == "transfer")
+        # t_ml_start = time.perf_counter()
+        try:
+            feat_origin = self._encode_feature(origin, 'Origin_Node')
+            feat_dest = self._encode_feature(destination, 'Destination_Node')
+            feat_mode = self._encode_feature(transport_mode, 'Transport_Mode')
+            feat_leg = self._encode_feature(leg_type, 'Leg_Type')
+            feat_cond = self._encode_feature(condition_flag, 'Condition_Flag')
+            if None in (feat_origin, feat_dest, feat_mode, feat_leg, feat_cond):
+                return {"final_delay_presented": 0.0, "covered": False,
+                        "calibration_reason": "Lane not in model training vocabulary"}
+            
+            X_input = pd.DataFrame([{'Leg_Type': feat_leg, 'Origin_Node': feat_origin, 'Destination_Node': feat_dest,
+                                     'Transport_Mode': feat_mode, 'Condition_Flag': feat_cond, 'NLP_Severity_Score': nlp_score}])
+            
+            # 1. Raw p85 Inference
+            raw_prediction = float(self.model.predict(X_input)[0])
 
-        if persona == "FASTEST":
-            ref = refs["surface"]
-            if ref and ref["eta"] > eta:
-                claim = f"Arrives {round(ref['eta'] - eta, 1)}h sooner than the fastest surface-only alternative."
-            elif ref:
-                claim = f"Matches the surface-only alternative within {round(abs(ref['eta'] - eta), 1)}h."
+            # 1b. SHAP explainability for this specific prediction (exact, not approximate,
+            # for tree models — TreeExplainer walks the trained tree structure directly).
+            shap_breakdown = self._explain_prediction(X_input, origin, destination,
+                                                        transport_mode, leg_type, condition_flag)
+
+            # 2. Statistical Calibration (Derived from Historical p95)
+            mode_key = transport_mode.lower()
+            profile = self.profiles.get(mode_key, {"floor": 0.0, "cap": 240.0})
+            
+            floor = profile["floor"]
+            cap = profile["cap"]
+            
+            calibrated_delay = min(max(0.0, raw_prediction), cap)
+            
+            # 3. Restore Systemic Friction (p5 Baseline)
+            final_delay = max(calibrated_delay, floor)
+            
+            # Explainability
+            reason = "Optimal Flow"
+            if final_delay == floor and calibrated_delay < floor:
+                reason = f"Baseline Operational Friction (Historical p5: {floor}h)"
+            elif calibrated_delay < raw_prediction:
+                reason = f"Operational Cap Applied (Historical p95 Bound: {cap}h)"
+            elif raw_prediction > floor:
+                reason = "Quantile Disruption Prediction (p85 Risk)"
+
+            return {
+                "raw_model_prediction": round(raw_prediction, 2),
+                "calibrated_delay": round(calibrated_delay, 2),
+                "baseline_systemic_friction": floor,
+                "final_delay_presented": round(final_delay, 2),
+                "calibration_reason": reason,
+                "p_quantile": 0.85,
+                "is_defensible": True,
+                # Named "operating_range" rather than "confidence_band" on purpose:
+                # p85 is a real per-request model prediction, but floor/cap are static
+                # historical bounds per transport mode, not per-request quantiles.
+                "operating_range": {
+                    "p5_floor": floor,
+                    "p85_prediction": round(raw_prediction, 2),
+                    "p95_cap": cap
+                },
+                "shap_explanation": shap_breakdown
+            }
+            
+        except Exception as e:
+            print(f"Calibration Inference Error: {e}")
+            return {"final_delay_presented": 0.0, "covered": False, "calibration_reason": "Inference Error"}
+
+class ContrastiveNLPEngine:
+    """Stage 2: PRODUCTION Contrastive NLP Brain."""
+    def __init__(self, lazy_load=False):
+        self._ready = False
+        self.noise_floor = 0.04
+        # Realistic contrastive margins from all-MiniLM-L6-v2 on supply-chain
+        # anchors range 0.05 (mild disruption) to 0.40 (severe blockage/strike).
+        # We map that range to [0, 1] by dividing by the expected maximum.
+        # min(1.0, ...) clamps any outlier margin above 0.40.
+        self.max_expected_margin = 0.40
+        if not lazy_load:
+            self.warmup()
+
+    def warmup(self):
+        if self._ready: return
+        print("[NLP ENGINE] Starting warmup...")
+        try:
+            from sentence_transformers import SentenceTransformer, util
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            self.util = util
+            if os.path.exists(NLP_ANCHORS_PATH):
+                anchors = torch.load(NLP_ANCHORS_PATH, map_location=torch.device("cpu"))
+                self.disaster_matrix = anchors["disaster_matrix"]
+                self.safe_matrix = anchors["safe_matrix"]
+                self._ready = True
+                print(f"NLP Brain: Loaded Historical Anchor Matrix.")
             else:
-                claim = "No surface-only alternative exists for this lane."
-            return (f"Velocity-optimized. {claim} {transfer_count} strategic transfer(s) "
-                    f"totalling {round(trace['eta']['transfer'], 1)}h.")
+                self._ready = False
+        except Exception as e:
+            print(f"[NLP ENGINE] Warmup failed: {e}")
+            self._ready = False
 
-        if persona == "SAFEST":
-            worse = [t for t in peer_threats if t > threat]
-            if worse:
-                peak = max(worse)
-                claim = (f"Holds threat exposure {round((peak - threat) / peak * 100)}% below the "
-                         f"{round(peak * 100)}% ceiling of the alternatives evaluated.")
-            else:
-                claim = (f"Ties the lowest threat exposure of the alternatives evaluated "
-                         f"at {round(threat * 100)}%.")
-            return f"Resilience-optimized. {claim} Lead-time integrity prioritized over cost."
+    def get_semantic_score(self, news_text: str) -> float:
+        if not self._ready: return 0.0
+        if not news_text or len(news_text.strip()) < 5: return 0.0
+        chunks = [news_text[i:i+256] for i in range(0, len(news_text), 256)]
+        chunk_embeddings = self.model.encode(chunks, convert_to_tensor=True)
+        d_scores = self.util.cos_sim(chunk_embeddings, self.disaster_matrix)
+        s_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
+        margin = float(np.max(d_scores.cpu().numpy())) - float(np.max(s_scores.cpu().numpy()))
+        if margin < self.noise_floor:
+            return 0.0
+        return float(min(1.0, margin / self.max_expected_margin))
 
-        ref = refs["air"]
-        if ref and ref["cost"] > 0:
-            delta = (ref["cost"] - cost) / ref["cost"] * 100
-            claim = (f"Lands {round(delta)}% below the air-only alternative (${round(ref['cost'] - cost)} saved)."
-                     if delta >= 0 else
-                     f"Priced {round(-delta)}% above the air-only alternative (${round(cost - ref['cost'])} premium).")
-        elif ref:
-            claim = "Air-only alternative priced at zero; no cost basis to compare."
-        else:
-            claim = "No air-only alternative exists for this lane."
-        scen = (f" Scenario adds ${round(trace['cost']['scenario'])} and {round(trace['eta']['scenario'])}h."
-                if trace["cost"]["scenario"] or trace["eta"]["scenario"] else "")
-        return f"Economic-optimized. {claim} Lead time {round(eta, 1)}h at ${round(cost)} landed.{scen}"
+class CARFFilter:
+    """Stage 3: TRUE CARF (Context-Aware Relevance Filter)."""
+
+    def __init__(self):
+        self.relevance_map = {
+            "air":  ["airport", "flight", "airspac", "aviat", "runway"],
+            "sea":  ["port", "vessel", "ship", "canal", "ocean", "maritim", "dock", "freight"],
+            "rail": ["rail", "track", "locomot", "station"],
+            "road": ["highway", "truck", "traff", "bridge", "road", "deliver"]
+        }
+
+    def _matches_mode(self, words: set, mode: str) -> bool:
+        stems = self.relevance_map.get(mode, [])
+        return any(word.startswith(stem) for word in words for stem in stems)
+
+    def apply_filter(self, semantic_score: float, news_context: str, transport_mode: str) -> float:
+        if semantic_score <= 0:
+            return 0.0
+
+        mode = transport_mode.lower()
+        if mode not in self.relevance_map:
+            return semantic_score
+
+        words = set(re.findall(r"[a-z]+", news_context.lower()))
+
+        matches_own = self._matches_mode(words, mode)
+        matches_other = any(
+            self._matches_mode(words, m)
+            for m in self.relevance_map
+            if m != mode
+        )
+
+        if matches_other and not matches_own:
+            return 0.0
+        return semantic_score
+
+    def max_pool_threats(self, scores: List[float]) -> float:
+        return float(np.max(scores)) if scores else 0.0

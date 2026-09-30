@@ -7,6 +7,7 @@ import time
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
 import re
+import shap
 
 # Load Production Artifacts
 MODEL_PATH = "./Execution/risk_model.pkl"
@@ -24,14 +25,23 @@ class ThreatIntelligencePredictor:
         self.model = None
         self.encoders = None
         self.profiles = {}
+        self.explainer = None
         
         self.hub_map = {
-            "Seattle": "Seattle Port", "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
+            "Seattle": "Seattle Port", "Seattle-Tacoma": "Seattle Port", "Seattle BNSF Terminal": "Seattle Port",
+            "Portland": "Portland Terminal", "San Francisco": "San Francisco Port",
             "Los Angeles": "Los Angeles Port", "Salt Lake City": "Salt Lake City Hub", "Denver": "Denver Terminal",
-            "Phoenix": "Phoenix Logistics", "Dallas": "Dallas Corridor", "Houston": "Houston Port",
-            "Chicago": "Chicago Rail Hub", "St. Louis": "St. Louis Hub", "Atlanta": "Atlanta Air Hub",
+            "Phoenix": "Phoenix Logistics", "Dallas": "Dallas Corridor", "Alliance Texas Logistics Hub": "Dallas Corridor",
+            "Houston": "Houston Port",
+            "Chicago": "Chicago Rail Hub", "Chicago Intermodal Complex": "Chicago Rail Hub", "Chicago O'Hare International": "Chicago Rail Hub",
+            "St. Louis": "St. Louis Hub",
+            "Atlanta": "Atlanta Air Hub", "Hartsfield-Jackson Atlanta": "Atlanta Air Hub",
             "Miami": "Miami Port", "New York": "New York Port", "Boston": "Boston Terminal",
-            "Mumbai": "Mumbai Port", "Kochi": "Kochi Port", "Delhi": "Delhi Air Cargo", "Chennai": "Chennai Port"
+            "Mumbai": "Mumbai Port", "Kochi": "Kochi Port", "Delhi": "Delhi Air Cargo", "Chennai": "Chennai Port",
+            "Shanghai": "Shanghai Port", "Singapore": "Singapore Port",
+            "Rotterdam": "Rotterdam Port",
+            "Dubai": "Dubai Logistics Hub", "Al Maktoum International": "Dubai Logistics Hub",
+            "Suez Canal": "Suez Canal",
         }
         
         if not lazy_load:
@@ -48,6 +58,15 @@ class ThreatIntelligencePredictor:
         self.model = joblib.load(MODEL_PATH)
         self.encoders = joblib.load(ENCODER_PATH)
         self.is_trained = True
+
+        # 1b. Build the SHAP explainer once, since it only needs the trained tree
+        # structure (no training data required) and is cheap to reuse per request.
+        try:
+            self.explainer = shap.TreeExplainer(self.model)
+            print("[PREDICTOR] SHAP TreeExplainer ready.")
+        except Exception as e:
+            print(f"[PREDICTOR] SHAP explainer failed to initialize: {e}")
+            self.explainer = None
         
         # 2. Load Statistically Defensible Calibration Profiles
         if os.path.exists(CALIBRATION_PATH):
@@ -74,6 +93,55 @@ class ThreatIntelligencePredictor:
             if hit is not None:
                 return int(encoder.transform([hit])[0])
         return None
+
+    def _explain_prediction(self, X_input: pd.DataFrame, origin: str, destination: str,
+                             transport_mode: str, leg_type: str, condition_flag: str) -> Optional[Dict[str, Any]]:
+        """
+        Decomposes this single prediction into per-feature contributions via SHAP.
+        Values sum exactly to (prediction - base_value), by construction.
+        Encoded categorical features are mapped back to their original human-readable
+        labels so the output is readable without needing the encoder to interpret it.
+        """
+        if self.explainer is None:
+            return None
+        try:
+            # Different shap/numpy versions return expected_value and shap_values with
+            # slightly different shapes (plain float, numpy scalar, or a length-1 array).
+            # Flatten defensively so float() always gets a true 0-dimensional value.
+            raw_shap = np.asarray(self.explainer.shap_values(X_input))
+            shap_values = raw_shap.reshape(-1)  # single row -> exactly len(X_input.columns) values
+
+            raw_expected = self.explainer.expected_value
+            base_value = float(np.asarray(raw_expected).reshape(-1)[0])
+
+            # Human-readable label for each feature, not the raw encoded integer
+            readable_values = {
+                'Leg_Type': leg_type,
+                'Origin_Node': origin,
+                'Destination_Node': destination,
+                'Transport_Mode': transport_mode,
+                'Condition_Flag': condition_flag,
+                'NLP_Severity_Score': round(float(X_input['NLP_Severity_Score'].iloc[0]), 3)
+            }
+
+            contributions = [
+                {
+                    "feature": col,
+                    "value": readable_values.get(col, X_input[col].iloc[0]),
+                    "contribution_hours": round(float(shap_values[i]), 2)
+                }
+                for i, col in enumerate(X_input.columns)
+            ]
+            # Largest absolute impact first, so the top driver of the delay is obvious at a glance
+            contributions.sort(key=lambda c: abs(c["contribution_hours"]), reverse=True)
+
+            return {
+                "base_value_hours": round(base_value, 2),
+                "contributions": contributions
+            }
+        except Exception as e:
+            print(f"[SHAP] Explanation failed: {e}")
+            return None
 
     def predict_worst_case_delay(self, origin: str, destination: str, transport_mode: str, 
                                  leg_type: str = "Global_Freight", condition_flag: str = "Clear", 
@@ -111,7 +179,12 @@ class ThreatIntelligencePredictor:
             
             # 1. Raw p85 Inference
             raw_prediction = float(self.model.predict(X_input)[0])
-            
+
+            # 1b. SHAP explainability for this specific prediction (exact, not approximate,
+            # for tree models — TreeExplainer walks the trained tree structure directly).
+            shap_breakdown = self._explain_prediction(X_input, origin, destination,
+                                                        transport_mode, leg_type, condition_flag)
+
             # 2. Statistical Calibration (Derived from Historical p95)
             mode_key = transport_mode.lower()
             profile = self.profiles.get(mode_key, {"floor": 0.0, "cap": 240.0})
@@ -140,7 +213,16 @@ class ThreatIntelligencePredictor:
                 "final_delay_presented": round(final_delay, 2),
                 "calibration_reason": reason,
                 "p_quantile": 0.85,
-                "is_defensible": True
+                "is_defensible": True,
+                # Named "operating_range" rather than "confidence_band" on purpose:
+                # p85 is a real per-request model prediction, but floor/cap are static
+                # historical bounds per transport mode, not per-request quantiles.
+                "operating_range": {
+                    "p5_floor": floor,
+                    "p85_prediction": round(raw_prediction, 2),
+                    "p95_cap": cap
+                },
+                "shap_explanation": shap_breakdown
             }
             
         except Exception as e:
