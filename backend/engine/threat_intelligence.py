@@ -190,32 +190,36 @@ class ContrastiveNLPEngine:
 
 class CARFFilter:
     """Stage 3: TRUE CARF (Context-Aware Relevance Filter)."""
-    def __init__(self):
-        self.relevance_map = {"air": ["airport", "flight", "airspace", "aviation", "sky", "terminal"],
-                              "sea": ["port", "vessel", "ship", "canal", "ocean", "maritime", "dock"],
-                              "rail": ["rail", "track", "locomotive", "station"],
-                              "road": ["highway", "truck", "traffic", "bridge", "road", "delivery"]}
 
+    def __init__(self):
+        self.relevance_map = {
+            "air":  ["airport", "flight", "airspac", "aviat", "runway"],
+            "sea":  ["port", "vessel", "ship", "canal", "ocean", "maritim", "dock", "freight"],
+            "rail": ["rail", "track", "locomot", "station"],
+            "road": ["highway", "truck", "traff", "bridge", "road", "deliver"]
+        }
+
+    def _matches_mode(self, words: set, mode: str) -> bool:
+        stems = self.relevance_map.get(mode, [])
+        return any(word.startswith(stem) for word in words for stem in stems)
 
     def apply_filter(self, semantic_score: float, news_context: str, transport_mode: str) -> float:
         if semantic_score <= 0:
             return 0.0
 
         mode = transport_mode.lower()
-        own_keywords = self.relevance_map.get(mode)
-        if not own_keywords:
-            return semantic_score  # unknown mode: don't filter
+        if mode not in self.relevance_map:
+            return semantic_score
 
         words = set(re.findall(r"[a-z]+", news_context.lower()))
 
-        matches_own = bool(words & set(own_keywords))
+        matches_own = self._matches_mode(words, mode)
         matches_other = any(
-            words & set(kws)
-            for m, kws in self.relevance_map.items()
+            self._matches_mode(words, m)
+            for m in self.relevance_map
             if m != mode
         )
 
-        # Suppress only if the news is about another mode and not this one
         if matches_other and not matches_own:
             return 0.0
         return semantic_score
