@@ -152,7 +152,11 @@ class ContrastiveNLPEngine:
     def __init__(self, lazy_load=False):
         self._ready = False
         self.noise_floor = 0.04
-        self.calibration_multiplier = 0.35
+        # Realistic contrastive margins from all-MiniLM-L6-v2 on supply-chain
+        # anchors range 0.05 (mild disruption) to 0.40 (severe blockage/strike).
+        # We map that range to [0, 1] by dividing by the expected maximum.
+        # min(1.0, ...) clamps any outlier margin above 0.40.
+        self.max_expected_margin = 0.40
         if not lazy_load:
             self.warmup()
 
@@ -176,7 +180,6 @@ class ContrastiveNLPEngine:
             self._ready = False
 
     def get_semantic_score(self, news_text: str) -> float:
-        # t_nlp_start = time.perf_counter()
         if not self._ready: return 0.0
         if not news_text or len(news_text.strip()) < 5: return 0.0
         chunks = [news_text[i:i+256] for i in range(0, len(news_text), 256)]
@@ -184,9 +187,9 @@ class ContrastiveNLPEngine:
         d_scores = self.util.cos_sim(chunk_embeddings, self.disaster_matrix)
         s_scores = self.util.cos_sim(chunk_embeddings, self.safe_matrix)
         margin = float(np.max(d_scores.cpu().numpy())) - float(np.max(s_scores.cpu().numpy()))
-        # bug 1 fix
-        if margin < self.noise_floor: return 0.0
-        return float(min(1.0, margin * self.calibration_multiplier))
+        if margin < self.noise_floor:
+            return 0.0
+        return float(min(1.0, margin / self.max_expected_margin))
 
 class CARFFilter:
     """Stage 3: TRUE CARF (Context-Aware Relevance Filter)."""
