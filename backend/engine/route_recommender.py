@@ -41,8 +41,10 @@ class RouteRecommender:
         print(f"[STARTUP] Initializing Split-Node Global Topology...")
         self.unified_graph = create_multimodal_network()
 
+
         if self.demo_mode:
-            self.is_warmed_up = True
+            print("[DEMO MODE] Running synchronous warmup...")
+            self.run_background_warmup()
 
         print(f"[STARTUP] Unified Engine Ready.")
 
@@ -91,23 +93,35 @@ class RouteRecommender:
             out[pair] = {"threat": self._score_cache[ck], "news": text, "source": source}
         return out
 
-    def _ml_buffer(self, G, u, v, nlp_score):
-        """p85 worst-case delay (hours) for one transit edge, or None if the model
-        isn't loaded or doesn't cover this lane."""
+    def _ml_buffer(self, G, u, v, nlp_score, disruptions=None):
         if not getattr(self.predictor, "is_trained", False):
-            return None  # untrained predictor returns generic priors; don't add those to every leg
+            return None
         d = G[u][v]
+        disruptions = disruptions or {}
+
+        # Derive condition from active disruptions on the destination node
+        p_id = G.nodes[v].get("physical_id", "")
+        if p_id in disruptions:
+            threat_level = disruptions[p_id].get("threat", 0.0)
+            condition_flag = "Disrupted" if threat_level >= 0.75 else "Degraded"
+        else:
+            condition_flag = "Clear"
+
         key = (G.nodes[u].get("display_name"), G.nodes[v].get("display_name"),
-               d["transport_mode"], round(nlp_score, 1))
+            d["transport_mode"], round(nlp_score, 1), condition_flag)
+
         if key not in self._ml_cache:
             try:
-                r = self.predictor.predict_worst_case_delay(key[0], key[1], key[2], nlp_score=nlp_score)
+                r = self.predictor.predict_worst_case_delay(
+                    key[0], key[1], key[2],
+                    nlp_score=nlp_score,
+                    condition_flag=condition_flag
+                )
                 self._ml_cache[key] = float(r["final_delay_presented"]) if r.get("covered", True) else None
             except Exception as e:
                 print(f"[ML] p85 lookup failed for {key}: {e}")
                 self._ml_cache[key] = None
         return self._ml_cache[key]
-
     def _enrich(self, G, edges, disruptions, intel, buffers):
         transit = [(u, v) for u, v in edges if G[u][v]["type"] != "transfer"]
         pairs = {(G.nodes[v].get("physical_id"), G[u][v]["transport_mode"]) for u, v in transit}
@@ -122,7 +136,7 @@ class RouteRecommender:
                 buffers[(u, v)] = None
                 continue
             threat = self._edge_threat(d, pid, d["transport_mode"], intel)
-            buffers[(u, v)] = self._ml_buffer(G, u, v, threat)
+            buffers[(u, v)] = self._ml_buffer(G, u, v, threat, disruptions=disruptions)
 
     @staticmethod
     def _edge_threat(d, p_id, mode, intel):
